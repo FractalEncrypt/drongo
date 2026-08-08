@@ -1,0 +1,390 @@
+package com.sparrowwallet.drongo.antiexfil;
+
+import com.sparrowwallet.drongo.protocol.Sha256Hash;
+import com.sparrowwallet.drongo.wallet.Keystore;
+
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.EOFException;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.security.SecureRandom;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+import static com.sparrowwallet.drongo.antiexfil.AntiExfilException.Code.*;
+
+public final class AntiExfilCoordinator {
+    private static final byte[] MAGIC = {'A', 'E', 'X', 'S'};
+    private static final int VERSION = 1;
+    private static final int MAX_STATE_BYTES = 32 * 1024 * 1024;
+    private static final int MAX_PSBT_BYTES = 16 * 1024 * 1024;
+    private static final int MAX_BLOB_BYTES = 16 * 1024 * 1024;
+
+    private final Path sessionPath;
+    private final Path journalPath;
+    private final Keystore keystore;
+    private final byte[] walletIdentity;
+
+    private AntiExfilCoordinator(Path sessionPath, Path journalPath, Keystore keystore) {
+        if(sessionPath == null || journalPath == null || keystore == null) throw fail(STATE_INVALID, "Coordinator paths and keystore are required");
+        this.sessionPath = sessionPath;
+        this.journalPath = journalPath;
+        this.keystore = keystore;
+        this.walletIdentity = walletIdentity(keystore);
+    }
+
+    public static AntiExfilCoordinator create(Path sessionPath, Path journalPath, byte[] originalPsbt,
+                                               Keystore keystore, AntiExfilNetwork network) {
+        return create(sessionPath, journalPath, originalPsbt, keystore, network, false, new SecureRandom());
+    }
+
+    public static AntiExfilCoordinator create(Path sessionPath, Path journalPath, byte[] originalPsbt,
+                                               Keystore keystore, AntiExfilNetwork network,
+                                               boolean acknowledgePostRevealAbortRisk) {
+        return create(sessionPath, journalPath, originalPsbt, keystore, network,
+                acknowledgePostRevealAbortRisk, new SecureRandom());
+    }
+
+    static AntiExfilCoordinator create(Path sessionPath, Path journalPath, byte[] originalPsbt,
+                                        Keystore keystore, AntiExfilNetwork network,
+                                        boolean acknowledgePostRevealAbortRisk, SecureRandom random) {
+        AntiExfilCoordinator coordinator = new AntiExfilCoordinator(sessionPath, journalPath, keystore);
+        if(originalPsbt == null || originalPsbt.length > MAX_PSBT_BYTES || network == null || random == null) {
+            throw fail(INVALID_MESSAGE, "Invalid coordinator initialization");
+        }
+        List<AntiExfilSigningSlot> slots = AntiExfilPsbt.enumerateSigningSlots(originalPsbt, keystore);
+        byte[] sessionId = random32(random);
+        Map<AntiExfilSigningSlot.Identifier, byte[]> rhos = new LinkedHashMap<>();
+        for(AntiExfilSigningSlot slot : slots) {
+            byte[] rho;
+            int attempts = 0;
+            do {
+                if(attempts++ >= 1024) throw fail(STATE_INVALID, "CSPRNG repeatedly produced duplicate host randomness");
+                rho = random32(random);
+            } while(containsValue(rhos, rho));
+            rhos.put(slot.getIdentifier(), rho);
+        }
+        AntiExfilMessage commit = AntiExfilPsbt.buildHostCommitMessage(originalPsbt, keystore, network, sessionId, rhos);
+        State state = new State(Phase.COMMITMENTS_CREATED, coordinator.walletIdentity, originalPsbt,
+                AntiExfilCodec.encode(commit), null, null, null, null, rhos);
+        List<AntiExfilAbortJournal.AbortEvent> aborts = new AntiExfilAbortJournal(journalPath, coordinator.walletIdentity).getEvents();
+        if(!aborts.isEmpty() && !acknowledgePostRevealAbortRisk) {
+            throw fail(RETRY_CONFLICT, "Post-reveal abort history requires explicit high-severity acknowledgement before a fresh session");
+        }
+        AntiExfilDurableFiles.locked(sessionPath, () -> {
+            AntiExfilDurableFiles.write(sessionPath, encode(state), true);
+            return null;
+        });
+        return coordinator;
+    }
+
+    public static AntiExfilCoordinator load(Path sessionPath, Path journalPath, Keystore keystore) {
+        AntiExfilCoordinator coordinator = new AntiExfilCoordinator(sessionPath, journalPath, keystore);
+        coordinator.readValidatedState();
+        new AntiExfilAbortJournal(journalPath, coordinator.walletIdentity).getEvents();
+        return coordinator;
+    }
+
+    public byte[] getHostCommitMessage() {
+        return readValidatedState().message1.clone();
+    }
+
+    public byte[] acceptOpenings(byte[] encodedOpenings) {
+        if(encodedOpenings == null) throw fail(INVALID_MESSAGE, "Signer openings are required");
+        return AntiExfilDurableFiles.locked(sessionPath, () -> {
+            State state = readValidatedStateUnlocked();
+            if(state.phase == Phase.COMPLETE || state.phase == Phase.OPENINGS_ACCEPTED) {
+                if(!Arrays.equals(encodedOpenings, state.message2)) throw fail(RETRY_CONFLICT, "Retry changed accepted signer openings");
+                return state.message3.clone();
+            }
+            AntiExfilMessage commit = AntiExfilCodec.decode(state.message1);
+            AntiExfilMessage openings = AntiExfilCodec.decode(encodedOpenings);
+            if(openings.getStage() != AntiExfilStage.SIGNER_OPENINGS) throw fail(WRONG_STAGE, "Expected signer openings");
+            AntiExfilCodec.validateTransition(commit, openings);
+            List<AntiExfilSlot> revealSlots = new ArrayList<>(openings.getSlots().size());
+            for(AntiExfilSlot slot : openings.getSlots()) {
+                AntiExfilSigningSlot.Identifier identifier = identifier(slot);
+                byte[] rho = state.rhos.get(identifier);
+                if(rho == null) throw fail(SIGNATURE_SLOT_MISMATCH, "Opening has no authoritative host-randomness slot");
+                revealSlots.add(new AntiExfilSlot(slot.getInputIndex(), slot.getSighashType(), slot.getSignerPublicKey(),
+                        slot.getMessageHash(), slot.getCommitment(), slot.getOpening(), rho, null));
+            }
+            AntiExfilMessage reveal = new AntiExfilMessage(openings.getNetwork(), AntiExfilStage.HOST_REVEAL,
+                    openings.getSessionId(), openings.getPsbtDigest(), revealSlots);
+            AntiExfilCodec.validateTransition(openings, reveal);
+            byte[] message3 = AntiExfilCodec.encode(reveal);
+            State accepted = new State(Phase.OPENINGS_ACCEPTED, state.walletIdentity, state.originalPsbt,
+                    state.message1, encodedOpenings, message3, null, null, state.rhos);
+            // This durable write is the security boundary: no rho is returned before it succeeds.
+            AntiExfilDurableFiles.write(sessionPath, encode(accepted), false);
+            return message3.clone();
+        });
+    }
+
+    public Completion complete(byte[] encodedSignatures) {
+        if(encodedSignatures == null) throw fail(INVALID_MESSAGE, "Signer signatures are required");
+        return AntiExfilDurableFiles.locked(sessionPath, () -> {
+            State state = readValidatedStateUnlocked();
+            if(state.phase == Phase.COMMITMENTS_CREATED) throw fail(WRONG_STAGE, "Cannot complete before accepting openings");
+            if(state.phase == Phase.COMPLETE) {
+                if(!Arrays.equals(encodedSignatures, state.message4)) throw fail(RETRY_CONFLICT, "Completed session received different signatures");
+                return new Completion(state.signedPsbt, false);
+            }
+            AntiExfilMessage reveal = AntiExfilCodec.decode(state.message3);
+            AntiExfilMessage signatures = AntiExfilCodec.decode(encodedSignatures);
+            if(signatures.getStage() != AntiExfilStage.SIGNER_SIGNATURES) throw fail(WRONG_STAGE, "Expected signer signatures");
+            AntiExfilCodec.validateTransition(reveal, signatures);
+            byte[] signed = AntiExfilPsbt.reconstructSignedPsbt(state.originalPsbt, keystore,
+                    AntiExfilCodec.decode(state.message1), signatures, state.rhos);
+            State complete = new State(Phase.COMPLETE, state.walletIdentity, state.originalPsbt,
+                    state.message1, state.message2, state.message3, encodedSignatures, signed, state.rhos);
+            AntiExfilDurableFiles.write(sessionPath, encode(complete), false);
+            return new Completion(signed, false);
+        });
+    }
+
+    public AntiExfilAbortJournal.AbortEvent recordPostRevealAbort(AbortReason reason) {
+        return AntiExfilDurableFiles.locked(sessionPath, () -> {
+            State state = readValidatedStateUnlocked();
+            if(state.phase != Phase.OPENINGS_ACCEPTED) {
+                throw fail(WRONG_STAGE, "Only an incomplete post-reveal session can record a selective-abort event");
+            }
+            if(reason == null) throw fail(STATE_INVALID, "A post-reveal abort reason is required");
+            AntiExfilMessage commit = AntiExfilCodec.decode(state.message1);
+            return new AntiExfilAbortJournal(journalPath, walletIdentity).append(
+                    commit.getSessionId(), commit.getPsbtDigest(), reason.name());
+        });
+    }
+
+    public Status getStatus() {
+        State state = readValidatedState();
+        AntiExfilMessage commit = AntiExfilCodec.decode(state.message1);
+        int abortCount = new AntiExfilAbortJournal(journalPath, walletIdentity).getEvents().size();
+        return new Status(state.phase, commit.getSessionId(), commit.getPsbtDigest(), abortCount, false);
+    }
+
+    private State readValidatedState() {
+        return AntiExfilDurableFiles.locked(sessionPath, this::readValidatedStateUnlocked);
+    }
+
+    private State readValidatedStateUnlocked() throws IOException {
+        if(!Files.exists(sessionPath)) throw new IOException("Coordinator session does not exist");
+        State state = decode(AntiExfilDurableFiles.read(sessionPath, MAX_STATE_BYTES));
+        validateState(state);
+        return state;
+    }
+
+    private void validateState(State state) {
+        if(!Arrays.equals(walletIdentity, state.walletIdentity)) throw fail(STATE_INVALID, "Coordinator session belongs to another wallet key identity");
+        List<AntiExfilSigningSlot> slots = AntiExfilPsbt.enumerateSigningSlots(state.originalPsbt, keystore);
+        AntiExfilMessage commit = AntiExfilCodec.decode(state.message1);
+        AntiExfilMessage rebuilt = AntiExfilPsbt.buildHostCommitMessage(state.originalPsbt, keystore,
+                commit.getNetwork(), commit.getSessionId(), state.rhos);
+        if(!Arrays.equals(state.message1, AntiExfilCodec.encode(rebuilt))) throw fail(STATE_INVALID, "Stored commitment transcript is not authoritative");
+        if(state.rhos.size() != slots.size()) throw fail(STATE_INVALID, "Stored host-randomness set changed");
+        if(state.phase == Phase.COMMITMENTS_CREATED) {
+            if(state.message2 != null || state.message3 != null || state.message4 != null || state.signedPsbt != null) invalidPhase();
+            return;
+        }
+        if(state.message2 == null || state.message3 == null) invalidPhase();
+        AntiExfilMessage openings = AntiExfilCodec.decode(state.message2);
+        AntiExfilMessage reveal = AntiExfilCodec.decode(state.message3);
+        AntiExfilCodec.validateTransition(commit, openings);
+        AntiExfilCodec.validateTransition(openings, reveal);
+        for(AntiExfilSlot slot : reveal.getSlots()) {
+            byte[] expected = state.rhos.get(identifier(slot));
+            if(expected == null || !Arrays.equals(expected, slot.getHostRandomness())) throw fail(STATE_INVALID, "Stored reveal differs from durable randomness");
+        }
+        if(state.phase == Phase.OPENINGS_ACCEPTED) {
+            if(state.message4 != null || state.signedPsbt != null) invalidPhase();
+            return;
+        }
+        if(state.message4 == null || state.signedPsbt == null) invalidPhase();
+        AntiExfilMessage signatures = AntiExfilCodec.decode(state.message4);
+        AntiExfilCodec.validateTransition(reveal, signatures);
+        byte[] rebuiltSigned = AntiExfilPsbt.reconstructSignedPsbt(state.originalPsbt, keystore, commit, signatures, state.rhos);
+        if(!Arrays.equals(rebuiltSigned, state.signedPsbt)) throw fail(STATE_INVALID, "Stored signed PSBT is not reconstructible from verified signatures");
+    }
+
+    private static byte[] walletIdentity(Keystore keystore) {
+        if(keystore.getExtendedPublicKey() == null || keystore.getKeyDerivation() == null) throw fail(STATE_INVALID, "Public account keystore is required");
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        try {
+            bytes.write(keystore.getExtendedPublicKey().getKey().getPubKey());
+            bytes.write(keystore.getExtendedPublicKey().getKey().getChainCode());
+            bytes.write(keystore.getKeyDerivation().toString().getBytes(StandardCharsets.US_ASCII));
+        } catch(IOException impossible) {
+            throw new AssertionError(impossible);
+        }
+        return Sha256Hash.hash(bytes.toByteArray());
+    }
+
+    private static byte[] encode(State state) throws IOException {
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        try(DataOutputStream output = new DataOutputStream(bytes)) {
+            output.write(MAGIC);
+            output.writeByte(VERSION);
+            output.writeByte(state.phase.ordinal());
+            output.write(state.walletIdentity);
+            writeBlob(output, state.originalPsbt);
+            writeBlob(output, state.message1);
+            writeNullableBlob(output, state.message2);
+            writeNullableBlob(output, state.message3);
+            writeNullableBlob(output, state.message4);
+            writeNullableBlob(output, state.signedPsbt);
+            output.writeShort(state.rhos.size());
+            for(Map.Entry<AntiExfilSigningSlot.Identifier, byte[]> entry : state.rhos.entrySet()) {
+                output.writeInt(entry.getKey().getInputIndex());
+                output.write(entry.getKey().getSignerPublicKey());
+                output.write(entry.getValue());
+            }
+        }
+        return bytes.toByteArray();
+    }
+
+    private static State decode(byte[] body) throws IOException {
+        try(DataInputStream input = new DataInputStream(new ByteArrayInputStream(body))) {
+            if(!Arrays.equals(input.readNBytes(4), MAGIC) || input.readUnsignedByte() != VERSION) throw new IOException("Unknown coordinator-state format");
+            int phaseCode = input.readUnsignedByte();
+            if(phaseCode >= Phase.values().length) throw new IOException("Unknown coordinator phase");
+            byte[] identity = input.readNBytes(32);
+            byte[] original = readBlob(input, MAX_PSBT_BYTES, false);
+            byte[] message1 = readBlob(input, AntiExfilCodec.MAX_MESSAGE_BYTES, false);
+            byte[] message2 = readBlob(input, AntiExfilCodec.MAX_MESSAGE_BYTES, true);
+            byte[] message3 = readBlob(input, AntiExfilCodec.MAX_MESSAGE_BYTES, true);
+            byte[] message4 = readBlob(input, AntiExfilCodec.MAX_MESSAGE_BYTES, true);
+            byte[] signed = readBlob(input, MAX_BLOB_BYTES, true);
+            int count = input.readUnsignedShort();
+            if(identity.length != 32 || count < 1 || count > AntiExfilCodec.MAX_SLOTS) throw new IOException("Invalid coordinator-state header");
+            Map<AntiExfilSigningSlot.Identifier, byte[]> rhos = new LinkedHashMap<>();
+            for(int i = 0; i < count; i++) {
+                int index = input.readInt();
+                byte[] key = input.readNBytes(33);
+                byte[] rho = input.readNBytes(32);
+                if(key.length != 33 || rho.length != 32 || rhos.put(new AntiExfilSigningSlot.Identifier(index, key), rho) != null) {
+                    throw new IOException("Invalid or duplicate coordinator randomness record");
+                }
+            }
+            if(input.available() != 0) throw new IOException("Trailing coordinator-state data");
+            return new State(Phase.values()[phaseCode], identity, original, message1, message2, message3, message4, signed, rhos);
+        } catch(EOFException e) {
+            throw new IOException("Truncated coordinator state", e);
+        }
+    }
+
+    private static void writeBlob(DataOutputStream output, byte[] value) throws IOException {
+        output.writeInt(value.length);
+        output.write(value);
+    }
+
+    private static void writeNullableBlob(DataOutputStream output, byte[] value) throws IOException {
+        if(value == null) output.writeInt(-1); else writeBlob(output, value);
+    }
+
+    private static byte[] readBlob(DataInputStream input, int maximum, boolean nullable) throws IOException {
+        int length = input.readInt();
+        if(nullable && length == -1) return null;
+        if(length < 1 || length > maximum) throw new IOException("Stored blob length is outside limits");
+        byte[] value = input.readNBytes(length);
+        if(value.length != length) throw new IOException("Truncated stored blob");
+        return value;
+    }
+
+    private static byte[] random32(SecureRandom random) {
+        byte[] value = new byte[32];
+        random.nextBytes(value);
+        return value;
+    }
+
+    private static boolean containsValue(Map<AntiExfilSigningSlot.Identifier, byte[]> values, byte[] candidate) {
+        return values.values().stream().anyMatch(value -> Arrays.equals(value, candidate));
+    }
+
+    private static AntiExfilSigningSlot.Identifier identifier(AntiExfilSlot slot) {
+        if(slot.getInputIndex() > Integer.MAX_VALUE) throw fail(SIGNATURE_SLOT_MISMATCH, "Input index is outside Java PSBT limits");
+        return new AntiExfilSigningSlot.Identifier((int)slot.getInputIndex(), slot.getSignerPublicKey());
+    }
+
+    private static void invalidPhase() {
+        throw fail(STATE_INVALID, "Coordinator phase and stored transcripts disagree");
+    }
+
+    private static AntiExfilException fail(AntiExfilException.Code code, String message) {
+        return new AntiExfilException(code, message);
+    }
+
+    public enum Phase {
+        COMMITMENTS_CREATED,
+        OPENINGS_ACCEPTED,
+        COMPLETE
+    }
+
+    public enum AbortReason {
+        TRANSPORT_FAILED,
+        SIGNER_CANCELLED,
+        SIGNATURE_REJECTED,
+        USER_ABANDONED
+    }
+
+    public static final class Completion {
+        private final byte[] signedPsbt;
+        private final boolean broadcast;
+
+        private Completion(byte[] signedPsbt, boolean broadcast) {
+            this.signedPsbt = signedPsbt.clone();
+            this.broadcast = broadcast;
+        }
+
+        public byte[] getSignedPsbt() { return signedPsbt.clone(); }
+        public boolean isBroadcast() { return broadcast; }
+    }
+
+    public static final class Status {
+        private final Phase phase;
+        private final byte[] sessionId;
+        private final byte[] psbtDigest;
+        private final int postRevealAbortCount;
+        private final boolean broadcast;
+
+        private Status(Phase phase, byte[] sessionId, byte[] psbtDigest, int postRevealAbortCount, boolean broadcast) {
+            this.phase = phase;
+            this.sessionId = sessionId.clone();
+            this.psbtDigest = psbtDigest.clone();
+            this.postRevealAbortCount = postRevealAbortCount;
+            this.broadcast = broadcast;
+        }
+
+        public Phase getPhase() { return phase; }
+        public byte[] getSessionId() { return sessionId.clone(); }
+        public byte[] getPsbtDigest() { return psbtDigest.clone(); }
+        public int getPostRevealAbortCount() { return postRevealAbortCount; }
+        public boolean isBroadcast() { return broadcast; }
+    }
+
+    private record State(Phase phase, byte[] walletIdentity, byte[] originalPsbt, byte[] message1,
+                         byte[] message2, byte[] message3, byte[] message4, byte[] signedPsbt,
+                         Map<AntiExfilSigningSlot.Identifier, byte[]> rhos) {
+        private State {
+            walletIdentity = walletIdentity.clone();
+            originalPsbt = originalPsbt.clone();
+            message1 = message1.clone();
+            message2 = copy(message2);
+            message3 = copy(message3);
+            message4 = copy(message4);
+            signedPsbt = copy(signedPsbt);
+            Map<AntiExfilSigningSlot.Identifier, byte[]> copied = new LinkedHashMap<>();
+            rhos.forEach((identifier, rho) -> copied.put(identifier, rho.clone()));
+            rhos = Map.copyOf(copied);
+        }
+
+        private static byte[] copy(byte[] value) { return value == null ? null : value.clone(); }
+    }
+}
