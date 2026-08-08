@@ -29,6 +29,7 @@ public class Keystore extends Persistable {
     private PaymentCode externalPaymentCode;
     private SilentPaymentScanAddress silentPaymentScanAddress;
     private byte[] deviceRegistration;
+    private boolean antiExfilRequired;
     private MasterPrivateExtendedKey masterPrivateExtendedKey;
     private DeterministicSeed seed;
 
@@ -122,6 +123,14 @@ public class Keystore extends Persistable {
 
     public void setDeviceRegistration(byte[] deviceRegistration) {
         this.deviceRegistration = deviceRegistration;
+    }
+
+    public boolean isAntiExfilRequired() {
+        return antiExfilRequired;
+    }
+
+    public void setAntiExfilRequired(boolean antiExfilRequired) {
+        this.antiExfilRequired = antiExfilRequired;
     }
 
     public boolean hasMasterPrivateExtendedKey() {
@@ -368,6 +377,10 @@ public class Keystore extends Persistable {
             throw new InvalidKeystoreException("No wallet model specified");
         }
 
+        if(antiExfilRequired && walletModel != WalletModel.SEEDSIGNER) {
+            throw new InvalidKeystoreException("Anti-exfil signing can only be required for a SeedSigner keystore");
+        }
+
         if(keyDerivation == null) {
             throw new InvalidKeystoreException("No key derivation specified");
         }
@@ -444,6 +457,7 @@ public class Keystore extends Persistable {
         copy.setId(getId());
         copy.setSource(source);
         copy.setWalletModel(walletModel);
+        copy.setAntiExfilRequired(antiExfilRequired);
         if(keyDerivation != null) {
             copy.setKeyDerivation(keyDerivation.copy());
         }

@@ -15,6 +15,21 @@ import java.util.List;
 
 public class KeystoreTest {
     @Test
+    public void antiExfilPolicyCopiesAndFailsClosedForOtherModels() {
+        Keystore keystore = new Keystore();
+        keystore.setWalletModel(WalletModel.SEEDSIGNER);
+        keystore.setAntiExfilRequired(true);
+
+        Keystore copy = keystore.copy();
+        Assertions.assertTrue(copy.isAntiExfilRequired());
+        Assertions.assertEquals(WalletModel.SEEDSIGNER, copy.getWalletModel());
+
+        copy.setWalletModel(WalletModel.SPARROW);
+        InvalidKeystoreException exception = Assertions.assertThrows(InvalidKeystoreException.class, copy::checkKeystore);
+        Assertions.assertEquals("Anti-exfil signing can only be required for a SeedSigner keystore", exception.getMessage());
+    }
+
+    @Test
     public void testExtendedPrivateKey() throws MnemonicException {
         Keystore keystore = new Keystore();
         DeterministicSeed seed = new DeterministicSeed("absent essay fox snake vast pumpkin height crouch silent bulb excuse razor", "", 0, DeterministicSeed.Type.BIP39);
