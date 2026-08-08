@@ -97,6 +97,22 @@ public final class AntiExfilCoordinator {
         return readValidatedState().message1.clone();
     }
 
+    public byte[] getFrozenPsbt() {
+        return readValidatedState().originalPsbt.clone();
+    }
+
+    public byte[] getHostRevealMessage() {
+        State state = readValidatedState();
+        if(state.phase == Phase.COMMITMENTS_CREATED) throw fail(WRONG_STAGE, "Signer openings have not been accepted");
+        return state.message3.clone();
+    }
+
+    public Completion getCompletedResult() {
+        State state = readValidatedState();
+        if(state.phase != Phase.COMPLETE) throw fail(WRONG_STAGE, "Coordinator session is not complete");
+        return new Completion(state.signedPsbt, false);
+    }
+
     public byte[] acceptOpenings(byte[] encodedOpenings) {
         if(encodedOpenings == null) throw fail(INVALID_MESSAGE, "Signer openings are required");
         return AntiExfilDurableFiles.locked(sessionPath, () -> {
@@ -215,6 +231,10 @@ public final class AntiExfilCoordinator {
     }
 
     private static byte[] walletIdentity(Keystore keystore) {
+        return getWalletKeyIdentity(keystore);
+    }
+
+    public static byte[] getWalletKeyIdentity(Keystore keystore) {
         if(keystore.getExtendedPublicKey() == null || keystore.getKeyDerivation() == null) throw fail(STATE_INVALID, "Public account keystore is required");
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
         try {

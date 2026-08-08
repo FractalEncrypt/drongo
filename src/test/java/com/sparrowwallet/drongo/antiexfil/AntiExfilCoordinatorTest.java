@@ -65,10 +65,12 @@ class AntiExfilCoordinatorTest {
     void persistsFrozenSessionBeforeReturningExactReveal() {
         AntiExfilCoordinator coordinator = create(session);
         assertArrayEquals(message1, coordinator.getHostCommitMessage());
+        assertArrayEquals(raw, coordinator.getFrozenPsbt());
         byte[] reveal = coordinator.acceptOpenings(message2);
 
         AntiExfilCoordinator reloaded = AntiExfilCoordinator.load(session, journal, keystore);
         assertEquals(AntiExfilCoordinator.Phase.OPENINGS_ACCEPTED, reloaded.getStatus().getPhase());
+        assertArrayEquals(reveal, reloaded.getHostRevealMessage());
         assertArrayEquals(reveal, reloaded.acceptOpenings(message2));
         AntiExfilMessage decoded = AntiExfilCodec.decode(reveal);
         assertEquals(AntiExfilStage.HOST_REVEAL, decoded.getStage());
@@ -104,6 +106,7 @@ class AntiExfilCoordinatorTest {
         assertEquals(AntiExfilCoordinator.Phase.COMPLETE, reloaded.getStatus().getPhase());
         assertFalse(reloaded.getStatus().isBroadcast());
         assertArrayEquals(completed.getSignedPsbt(), reloaded.complete(message4).getSignedPsbt());
+        assertArrayEquals(completed.getSignedPsbt(), reloaded.getCompletedResult().getSignedPsbt());
 
         byte[] changed = message4.clone();
         changed[changed.length - 1] ^= 1;
