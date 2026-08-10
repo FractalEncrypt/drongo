@@ -15,18 +15,19 @@ import java.util.List;
 
 public class KeystoreTest {
     @Test
-    public void antiExfilPolicyCopiesAndFailsClosedForOtherModels() {
+    public void antiExfilPolicyCopiesWithoutChangingWalletBrand() {
         Keystore keystore = new Keystore();
-        keystore.setWalletModel(WalletModel.SEEDSIGNER);
-        keystore.setAntiExfilRequired(true);
+        keystore.setWalletModel(WalletModel.SPECTER_DIY);
+        keystore.setAntiExfilPolicy(AntiExfilKeystorePolicy.REQUIRED);
 
         Keystore copy = keystore.copy();
         Assertions.assertTrue(copy.isAntiExfilRequired());
-        Assertions.assertEquals(WalletModel.SEEDSIGNER, copy.getWalletModel());
+        Assertions.assertTrue(copy.supportsAntiExfil());
+        Assertions.assertEquals(AntiExfilKeystorePolicy.REQUIRED, copy.getAntiExfilPolicy());
+        Assertions.assertEquals(WalletModel.SPECTER_DIY, copy.getWalletModel());
 
-        copy.setWalletModel(WalletModel.SPARROW);
-        InvalidKeystoreException exception = Assertions.assertThrows(InvalidKeystoreException.class, copy::checkKeystore);
-        Assertions.assertEquals("Anti-exfil signing can only be required for a SeedSigner keystore", exception.getMessage());
+        copy.setAntiExfilRequired(false);
+        Assertions.assertEquals(AntiExfilKeystorePolicy.OPTIONAL, copy.getAntiExfilPolicy());
     }
 
     @Test

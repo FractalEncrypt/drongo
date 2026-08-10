@@ -29,7 +29,7 @@ public class Keystore extends Persistable {
     private PaymentCode externalPaymentCode;
     private SilentPaymentScanAddress silentPaymentScanAddress;
     private byte[] deviceRegistration;
-    private boolean antiExfilRequired;
+    private AntiExfilKeystorePolicy antiExfilPolicy = AntiExfilKeystorePolicy.UNSUPPORTED;
     private MasterPrivateExtendedKey masterPrivateExtendedKey;
     private DeterministicSeed seed;
 
@@ -126,11 +126,27 @@ public class Keystore extends Persistable {
     }
 
     public boolean isAntiExfilRequired() {
-        return antiExfilRequired;
+        return antiExfilPolicy == AntiExfilKeystorePolicy.REQUIRED;
     }
 
     public void setAntiExfilRequired(boolean antiExfilRequired) {
-        this.antiExfilRequired = antiExfilRequired;
+        if(antiExfilRequired) {
+            antiExfilPolicy = AntiExfilKeystorePolicy.REQUIRED;
+        } else if(antiExfilPolicy == AntiExfilKeystorePolicy.REQUIRED) {
+            antiExfilPolicy = AntiExfilKeystorePolicy.OPTIONAL;
+        }
+    }
+
+    public AntiExfilKeystorePolicy getAntiExfilPolicy() {
+        return antiExfilPolicy;
+    }
+
+    public void setAntiExfilPolicy(AntiExfilKeystorePolicy antiExfilPolicy) {
+        this.antiExfilPolicy = Objects.requireNonNull(antiExfilPolicy, "Anti-exfil policy is required");
+    }
+
+    public boolean supportsAntiExfil() {
+        return antiExfilPolicy.isSupported();
     }
 
     public boolean hasMasterPrivateExtendedKey() {
@@ -377,10 +393,6 @@ public class Keystore extends Persistable {
             throw new InvalidKeystoreException("No wallet model specified");
         }
 
-        if(antiExfilRequired && walletModel != WalletModel.SEEDSIGNER) {
-            throw new InvalidKeystoreException("Anti-exfil signing can only be required for a SeedSigner keystore");
-        }
-
         if(keyDerivation == null) {
             throw new InvalidKeystoreException("No key derivation specified");
         }
@@ -457,7 +469,7 @@ public class Keystore extends Persistable {
         copy.setId(getId());
         copy.setSource(source);
         copy.setWalletModel(walletModel);
-        copy.setAntiExfilRequired(antiExfilRequired);
+        copy.setAntiExfilPolicy(antiExfilPolicy);
         if(keyDerivation != null) {
             copy.setKeyDerivation(keyDerivation.copy());
         }
