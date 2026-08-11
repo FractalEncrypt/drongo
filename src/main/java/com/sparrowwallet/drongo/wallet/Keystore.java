@@ -29,6 +29,7 @@ public class Keystore extends Persistable {
     private PaymentCode externalPaymentCode;
     private SilentPaymentScanAddress silentPaymentScanAddress;
     private byte[] deviceRegistration;
+    private AntiExfilKeystorePolicy antiExfilPolicy = AntiExfilKeystorePolicy.UNSUPPORTED;
     private MasterPrivateExtendedKey masterPrivateExtendedKey;
     private DeterministicSeed seed;
 
@@ -123,6 +124,30 @@ public class Keystore extends Persistable {
 
     public void setDeviceRegistration(byte[] deviceRegistration) {
         this.deviceRegistration = deviceRegistration;
+    }
+
+    public boolean isAntiExfilRequired() {
+        return antiExfilPolicy == AntiExfilKeystorePolicy.REQUIRED;
+    }
+
+    public void setAntiExfilRequired(boolean antiExfilRequired) {
+        if(antiExfilRequired) {
+            antiExfilPolicy = AntiExfilKeystorePolicy.REQUIRED;
+        } else if(antiExfilPolicy == AntiExfilKeystorePolicy.REQUIRED) {
+            antiExfilPolicy = AntiExfilKeystorePolicy.OPTIONAL;
+        }
+    }
+
+    public AntiExfilKeystorePolicy getAntiExfilPolicy() {
+        return antiExfilPolicy;
+    }
+
+    public void setAntiExfilPolicy(AntiExfilKeystorePolicy antiExfilPolicy) {
+        this.antiExfilPolicy = Objects.requireNonNull(antiExfilPolicy, "Anti-exfil policy is required");
+    }
+
+    public boolean supportsAntiExfil() {
+        return antiExfilPolicy.isSupported();
     }
 
     public boolean hasMasterPrivateExtendedKey() {
@@ -445,6 +470,7 @@ public class Keystore extends Persistable {
         copy.setId(getId());
         copy.setSource(source);
         copy.setWalletModel(walletModel);
+        copy.setAntiExfilPolicy(antiExfilPolicy);
         if(keyDerivation != null) {
             copy.setKeyDerivation(keyDerivation.copy());
         }
