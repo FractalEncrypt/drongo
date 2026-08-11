@@ -15,6 +15,22 @@ import java.util.List;
 
 public class KeystoreTest {
     @Test
+    public void antiExfilPolicyCopiesWithoutChangingWalletBrand() {
+        Keystore keystore = new Keystore();
+        keystore.setWalletModel(WalletModel.SPECTER_DIY);
+        keystore.setAntiExfilPolicy(AntiExfilKeystorePolicy.REQUIRED);
+
+        Keystore copy = keystore.copy();
+        Assertions.assertTrue(copy.isAntiExfilRequired());
+        Assertions.assertTrue(copy.supportsAntiExfil());
+        Assertions.assertEquals(AntiExfilKeystorePolicy.REQUIRED, copy.getAntiExfilPolicy());
+        Assertions.assertEquals(WalletModel.SPECTER_DIY, copy.getWalletModel());
+
+        copy.setAntiExfilRequired(false);
+        Assertions.assertEquals(AntiExfilKeystorePolicy.OPTIONAL, copy.getAntiExfilPolicy());
+    }
+
+    @Test
     public void testExtendedPrivateKey() throws MnemonicException {
         Keystore keystore = new Keystore();
         DeterministicSeed seed = new DeterministicSeed("absent essay fox snake vast pumpkin height crouch silent bulb excuse razor", "", 0, DeterministicSeed.Type.BIP39);
