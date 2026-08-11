@@ -1261,4 +1261,21 @@ public class PSBTInput {
 
         return hash;
     }
+
+    /**
+     * Returns the signature hash for this input using its declared (or default)
+     * sighash. This performs no signing and exposes the same digest used by the
+     * normal PSBT signing and verification paths.
+     */
+    public Sha256Hash getSigningHash() {
+        if(getUtxo() == null) {
+            throw new IllegalStateException("Input " + index + " has no UTXO");
+        }
+        Script signingScript = getSigningScript();
+        if(signingScript == null) {
+            throw new IllegalStateException("Input " + index + " has no signing script");
+        }
+        SigHash localSigHash = getSigHash() == null ? getDefaultSigHash() : getSigHash();
+        return getHashForSignature(signingScript, localSigHash);
+    }
 }
