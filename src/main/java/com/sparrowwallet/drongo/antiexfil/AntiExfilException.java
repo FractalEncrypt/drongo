@@ -9,7 +9,10 @@ public class AntiExfilException extends IllegalArgumentException {
         COMMITMENT_MISMATCH,
         OPENING_MISMATCH,
         SIGNATURE_INVALID,
-        UNEXPECTED_RETURN_DATA
+        UNEXPECTED_RETURN_DATA,
+        SESSION_MISMATCH,
+        RETRY_CONFLICT,
+        STATE_INVALID
     }
 
     private final Code code;
