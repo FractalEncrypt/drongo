@@ -1,0 +1,32 @@
+name: Anti-exfil review
+
+on:
+  push:
+    branches:
+      - anti-exfil-review-v1-ci
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Java 25 / Linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out review tree
+        uses: actions/checkout@v4
+
+      - name: Set up Java 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Run clean test suite
+        run: ./gradlew clean test --no-build-cache --rerun-tasks --console=plain
