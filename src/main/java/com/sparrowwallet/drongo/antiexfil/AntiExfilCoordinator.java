@@ -1,6 +1,7 @@
 package com.sparrowwallet.drongo.antiexfil;
 
 import com.sparrowwallet.drongo.protocol.Sha256Hash;
+import com.sparrowwallet.drongo.psbt.PSBT;
 import com.sparrowwallet.drongo.wallet.Keystore;
 
 import java.io.ByteArrayInputStream;
@@ -15,9 +16,12 @@ import java.nio.file.Path;
 import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.LinkedHashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static com.sparrowwallet.drongo.antiexfil.AntiExfilException.Code.*;
 
@@ -110,7 +114,7 @@ public final class AntiExfilCoordinator {
     public Completion getCompletedResult() {
         State state = readValidatedState();
         if(state.phase != Phase.COMPLETE) throw fail(WRONG_STAGE, "Coordinator session is not complete");
-        return new Completion(state.signedPsbt, false);
+        return completion(state);
     }
 
     public byte[] acceptOpenings(byte[] encodedOpenings) {
@@ -152,7 +156,7 @@ public final class AntiExfilCoordinator {
             if(state.phase == Phase.COMMITMENTS_CREATED) throw fail(WRONG_STAGE, "Cannot complete before accepting openings");
             if(state.phase == Phase.COMPLETE) {
                 if(!Arrays.equals(encodedSignatures, state.message4)) throw fail(RETRY_CONFLICT, "Completed session received different signatures");
-                return new Completion(state.signedPsbt, false);
+                return completion(state);
             }
             AntiExfilMessage reveal = AntiExfilCodec.decode(state.message3);
             AntiExfilMessage signatures = AntiExfilCodec.decode(encodedSignatures);
@@ -163,8 +167,41 @@ public final class AntiExfilCoordinator {
             State complete = new State(Phase.COMPLETE, state.walletIdentity, state.originalPsbt,
                     state.message1, state.message2, state.message3, encodedSignatures, signed, state.rhos);
             AntiExfilDurableFiles.write(sessionPath, encode(complete), false);
-            return new Completion(signed, false);
+            return completion(complete);
         });
+    }
+
+    private Completion completion(State state) {
+        return new Completion(state.signedPsbt, deriveVerifiedSignatures(state), false);
+    }
+
+    private Set<VerifiedAntiExfilSignature> deriveVerifiedSignatures(State state) {
+        if(state.phase != Phase.COMPLETE || state.message4 == null || state.signedPsbt == null) invalidPhase();
+        AntiExfilMessage commit = AntiExfilCodec.decode(state.message1);
+        AntiExfilMessage signatures = AntiExfilCodec.decode(state.message4);
+        List<AntiExfilSigningSlot> semantic = AntiExfilPsbt.enumerateSigningSlots(state.originalPsbt, keystore);
+        byte[] reconstructed = AntiExfilPsbt.reconstructSignedPsbt(state.originalPsbt, keystore,
+                commit, signatures, state.rhos);
+        if(!Arrays.equals(reconstructed, state.signedPsbt)) {
+            throw fail(STATE_INVALID, "Verified-signature evidence does not reconstruct the stored signed PSBT");
+        }
+        PSBT original = AntiExfilPsbt.parseCanonicalV0(state.originalPsbt);
+        byte[] originalDigest = Sha256Hash.hash(state.originalPsbt);
+        Set<VerifiedAntiExfilSignature> verified = new LinkedHashSet<>();
+        for(int i = 0; i < semantic.size(); i++) {
+            AntiExfilSigningSlot authoritative = semantic.get(i);
+            AntiExfilSlot signature = signatures.getSlots().get(i);
+            byte[] outpoint = original.getTransaction().getInputs().get(authoritative.getInputIndex())
+                    .getOutpoint().bitcoinSerialize();
+            verified.add(new VerifiedAntiExfilSignature(commit.getSessionId(), originalDigest,
+                    state.walletIdentity, authoritative.getInputIndex(), outpoint,
+                    authoritative.getSignerPublicKey(), authoritative.getMessageHash(),
+                    authoritative.getSighashType(), signature.getSignature()));
+        }
+        if(verified.size() != semantic.size()) {
+            throw fail(STATE_INVALID, "Verified-signature evidence contains duplicate records");
+        }
+        return Collections.unmodifiableSet(verified);
     }
 
     public AntiExfilAbortJournal.AbortEvent recordPostRevealAbort(AbortReason reason) {
@@ -356,14 +393,17 @@ public final class AntiExfilCoordinator {
 
     public static final class Completion {
         private final byte[] signedPsbt;
+        private final Set<VerifiedAntiExfilSignature> verifiedSignatures;
         private final boolean broadcast;
 
-        private Completion(byte[] signedPsbt, boolean broadcast) {
+        private Completion(byte[] signedPsbt, Set<VerifiedAntiExfilSignature> verifiedSignatures, boolean broadcast) {
             this.signedPsbt = signedPsbt.clone();
+            this.verifiedSignatures = Set.copyOf(verifiedSignatures);
             this.broadcast = broadcast;
         }
 
         public byte[] getSignedPsbt() { return signedPsbt.clone(); }
+        public Set<VerifiedAntiExfilSignature> getVerifiedSignatures() { return verifiedSignatures; }
         public boolean isBroadcast() { return broadcast; }
     }
 

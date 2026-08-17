@@ -20,6 +20,7 @@ import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -112,6 +113,39 @@ class AntiExfilCoordinatorTest {
         changed[changed.length - 1] ^= 1;
         AntiExfilException exception = assertThrows(AntiExfilException.class, () -> reloaded.complete(changed));
         assertEquals(AntiExfilException.Code.RETRY_CONFLICT, exception.getCode());
+    }
+
+    @Test
+    void derivesIdenticalImmutableSignatureProofsAtCompletionAndAfterReload() {
+        AntiExfilCoordinator coordinator = create(session);
+        coordinator.acceptOpenings(message2);
+        AntiExfilCoordinator.Completion completed = coordinator.complete(message4);
+
+        Set<VerifiedAntiExfilSignature> fresh = completed.getVerifiedSignatures();
+        assertEquals(5, fresh.size());
+        assertThrows(UnsupportedOperationException.class, fresh::clear);
+
+        AntiExfilMessage commit = AntiExfilCodec.decode(message1);
+        AntiExfilMessage signatures = AntiExfilCodec.decode(message4);
+        VerifiedAntiExfilSignature first = fresh.stream()
+                .filter(proof -> proof.getInputIndex() == 0)
+                .findFirst().orElseThrow();
+        assertArrayEquals(commit.getSessionId(), first.getSessionId());
+        assertArrayEquals(Sha256Hash.hash(raw), first.getOriginalPsbtDigest());
+        assertArrayEquals(AntiExfilCoordinator.getWalletKeyIdentity(keystore), first.getWalletKeyIdentity());
+        assertArrayEquals(signatures.getSlots().getFirst().getSignerPublicKey(), first.getSignerPublicKey());
+        assertArrayEquals(signatures.getSlots().getFirst().getMessageHash(), first.getMessageHash());
+        assertArrayEquals(signatures.getSlots().getFirst().getSignature(), first.getCompactSignature());
+        assertEquals(AntiExfilCodec.SIGHASH_ALL, first.getSighashType());
+        assertEquals(36, first.getOutpoint().length);
+
+        byte[] mutated = first.getCompactSignature();
+        mutated[0] ^= 1;
+        assertArrayEquals(signatures.getSlots().getFirst().getSignature(), first.getCompactSignature());
+
+        AntiExfilCoordinator reloaded = AntiExfilCoordinator.load(session, journal, keystore);
+        assertEquals(fresh, reloaded.getCompletedResult().getVerifiedSignatures());
+        assertEquals(fresh, reloaded.complete(message4).getVerifiedSignatures());
     }
 
     @Test
