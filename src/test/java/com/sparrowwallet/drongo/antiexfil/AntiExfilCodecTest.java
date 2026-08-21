@@ -8,6 +8,7 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -79,6 +80,59 @@ class AntiExfilCodecTest {
         for(int i = 0; i < rhos.length; i++) {
             assertArrayEquals(commit.getSlots().get(i).getCommitment(), AntiExfilCrypto.hostCommit(rhos[i]));
         }
+    }
+
+    @Test
+    void openingsMustBeUniquePerSignerKey() throws IOException {
+        AntiExfilMessage openings = AntiExfilCodec.decode(loadMessageVectors().get(1));
+        AntiExfilSlot first = openings.getSlots().get(0);
+        AntiExfilSlot second = openings.getSlots().get(1);
+
+        AntiExfilSlot repeatedForSameKey = copySlot(second, first.getSignerPublicKey(), first.getOpening());
+        List<AntiExfilSlot> repeatedSlots = sortedSlots(first, repeatedForSameKey, openings.getSlots().get(2));
+        AntiExfilMessage repeated = copyMessage(openings, repeatedSlots);
+        assertEquals(AntiExfilException.Code.OPENING_MISMATCH,
+                assertThrows(AntiExfilException.class, () -> AntiExfilCodec.encode(repeated)).getCode());
+
+        AntiExfilSlot distinctForSameKey = copySlot(second, first.getSignerPublicKey(), second.getOpening());
+        assertDoesNotThrow(() -> AntiExfilCodec.encode(copyMessage(openings,
+                sortedSlots(first, distinctForSameKey, openings.getSlots().get(2)))));
+
+        AntiExfilSlot repeatedAcrossDifferentKeys = copySlot(second, second.getSignerPublicKey(), first.getOpening());
+        assertDoesNotThrow(() -> AntiExfilCodec.encode(copyMessage(openings,
+                List.of(first, repeatedAcrossDifferentKeys, openings.getSlots().get(2)))));
+    }
+
+    @Test
+    void rejectsSharedHostNegativeVectors() throws IOException {
+        try(InputStream stream = AntiExfilCodecTest.class.getResourceAsStream("protocol-v1-negative-vectors.json")) {
+            assertNotNull(stream);
+            String vector = new String(stream.readAllBytes(), StandardCharsets.UTF_8);
+            Matcher matcher = MESSAGE_HEX.matcher(vector);
+            assertTrue(matcher.find());
+            byte[] encoded = Utils.hexToBytes(matcher.group(1));
+            AntiExfilException exception = assertThrows(AntiExfilException.class,
+                    () -> AntiExfilCodec.decode(encoded));
+            assertEquals(AntiExfilException.Code.OPENING_MISMATCH, exception.getCode());
+            assertFalse(matcher.find());
+        }
+    }
+
+    private static AntiExfilMessage copyMessage(AntiExfilMessage message, List<AntiExfilSlot> slots) {
+        return new AntiExfilMessage(message.getNetwork(), message.getStage(), message.getSessionId(),
+                message.getPsbtDigest(), slots);
+    }
+
+    private static AntiExfilSlot copySlot(AntiExfilSlot slot, byte[] signerPublicKey, byte[] opening) {
+        return new AntiExfilSlot(slot.getInputIndex(), slot.getSighashType(), signerPublicKey,
+                slot.getMessageHash(), slot.getCommitment(), opening, slot.getHostRandomness(), slot.getSignature());
+    }
+
+    private static List<AntiExfilSlot> sortedSlots(AntiExfilSlot... slots) {
+        List<AntiExfilSlot> sorted = new ArrayList<>(List.of(slots));
+        sorted.sort(Comparator.comparingLong(AntiExfilSlot::getInputIndex)
+                .thenComparing(AntiExfilSlot::getSignerPublicKey, Arrays::compareUnsigned));
+        return sorted;
     }
 
     private static byte[] repeat(byte value) {
