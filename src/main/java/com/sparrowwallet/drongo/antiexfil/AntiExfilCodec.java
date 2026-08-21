@@ -6,8 +6,10 @@ import java.math.BigInteger;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 import static com.sparrowwallet.drongo.antiexfil.AntiExfilException.Code.*;
@@ -116,6 +118,7 @@ public final class AntiExfilCodec {
         }
         Set<Bytes> commitments = new HashSet<>();
         Set<Bytes> reveals = new HashSet<>();
+        Map<Bytes, Set<Bytes>> openingsBySigner = new HashMap<>();
         long previousInput = -1;
         byte[] previousKey = null;
         int perInput = 0;
@@ -127,6 +130,13 @@ public final class AntiExfilCodec {
             if(perInput > MAX_SLOTS_PER_INPUT) throw fail(SIGNATURE_SLOT_MISMATCH, "Input exceeds the slot limit");
             if(!commitments.add(new Bytes(slot.getCommitment()))) throw fail(COMMITMENT_MISMATCH, "Duplicate host commitment");
             if(slot.getHostRandomness() != null && !reveals.add(new Bytes(slot.getHostRandomness()))) throw fail(COMMITMENT_MISMATCH, "Duplicate host reveal");
+            if(slot.getOpening() != null) {
+                Set<Bytes> signerOpenings = openingsBySigner.computeIfAbsent(
+                        new Bytes(slot.getSignerPublicKey()), ignored -> new HashSet<>());
+                if(!signerOpenings.add(new Bytes(slot.getOpening()))) {
+                    throw fail(OPENING_MISMATCH, "Signer openings must be unique per signer public key");
+                }
+            }
             previousInput = slot.getInputIndex();
             previousKey = slot.getSignerPublicKey();
         }
