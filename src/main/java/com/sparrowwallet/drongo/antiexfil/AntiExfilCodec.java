@@ -126,8 +126,6 @@ public final class AntiExfilCodec {
             validateSlot(message.getStage(), slot);
             int order = previousKey == null ? 1 : compareIdentifier(previousInput, previousKey, slot.getInputIndex(), slot.getSignerPublicKey());
             if(order >= 0 && previousKey != null) throw fail(SIGNATURE_SLOT_MISMATCH, "Slots are not uniquely ordered");
-            perInput = slot.getInputIndex() == previousInput ? perInput + 1 : 1;
-            if(perInput > MAX_SLOTS_PER_INPUT) throw fail(SIGNATURE_SLOT_MISMATCH, "Input exceeds the slot limit");
             if(!commitments.add(new Bytes(slot.getCommitment()))) throw fail(COMMITMENT_MISMATCH, "Duplicate host commitment");
             if(slot.getHostRandomness() != null && !reveals.add(new Bytes(slot.getHostRandomness()))) throw fail(COMMITMENT_MISMATCH, "Duplicate host reveal");
             if(slot.getOpening() != null) {
@@ -137,6 +135,8 @@ public final class AntiExfilCodec {
                     throw fail(OPENING_MISMATCH, "Signer openings must be unique per signer public key");
                 }
             }
+            perInput = slot.getInputIndex() == previousInput ? perInput + 1 : 1;
+            if(perInput > MAX_SLOTS_PER_INPUT) throw fail(SIGNATURE_SLOT_MISMATCH, "Input exceeds the slot limit");
             previousInput = slot.getInputIndex();
             previousKey = slot.getSignerPublicKey();
         }
