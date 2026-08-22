@@ -1,0 +1,27 @@
+name: Gate 3 validation CI
+
+on:
+  push:
+    branches:
+      - codex/v12-gate3-durable-bounds-ci
+
+permissions:
+  contents: read
+
+jobs:
+  linux-tests:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-java@0f481fcb613427c0f801b606911222b5b6f3083a # v5.5.0
+        with:
+          distribution: temurin
+          java-version: 25.0.2
+      - name: Run Gate 3 POSIX regressions
+        run: >-
+          ./gradlew test
+          --tests com.sparrowwallet.drongo.antiexfil.AntiExfilDurableFilesTest
+          --tests com.sparrowwallet.drongo.antiexfil.AntiExfilCodecTest
+          --tests com.sparrowwallet.drongo.antiexfil.AntiExfilAbortStateMachineTest
+      - name: Run full Drongo suite
+        run: ./gradlew test --rerun-tasks
