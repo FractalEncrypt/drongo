@@ -6,6 +6,7 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
+import java.nio.channels.OverlappingFileLockException;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -21,6 +22,7 @@ import static java.nio.file.attribute.PosixFilePermission.OWNER_WRITE;
 
 final class AntiExfilDurableFiles {
     private static final ConcurrentHashMap<Path, LocalLock> LOCAL_LOCKS = new ConcurrentHashMap<>();
+    private static final ReentrantLock JVM_DURABLE_LOCK = new ReentrantLock(true);
 
     private AntiExfilDurableFiles() {
     }
@@ -45,6 +47,15 @@ final class AntiExfilDurableFiles {
     }
 
     static <T> T locked(Path target, IOAction<T> action) {
+        JVM_DURABLE_LOCK.lock();
+        try {
+            return lockedInJvm(target, action);
+        } finally {
+            JVM_DURABLE_LOCK.unlock();
+        }
+    }
+
+    private static <T> T lockedInJvm(Path target, IOAction<T> action) {
         Path lockPath = null;
         LocalLock local = null;
         try {
@@ -57,10 +68,23 @@ final class AntiExfilDurableFiles {
                 return selected;
             });
             local.lock.lock();
-            try(FileChannel channel = FileChannel.open(lockPath, StandardOpenOption.CREATE, StandardOpenOption.WRITE);
-                FileLock ignored = channel.lock()) {
+            try(FileChannel pathChannel = FileChannel.open(lockPath, StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+                FileLock ignoredPath = pathChannel.lock()) {
+                if(Files.exists(canonical) && !isWindows()) {
+                    try(FileChannel stateChannel = FileChannel.open(canonical,
+                            StandardOpenOption.READ, StandardOpenOption.WRITE);
+                        FileLock ignoredState = stateChannel.lock()) {
+                        return action.run();
+                    }
+                }
+                // Windows does not permit atomic replacement while this process holds a FileChannel
+                // lock on the target. JVM_DURABLE_LOCK still serializes in-process aliases there;
+                // cross-process hard-link aliases remain a documented trusted-filesystem residual.
                 return action.run();
             }
+        } catch(OverlappingFileLockException e) {
+            throw new AntiExfilException(AntiExfilException.Code.STATE_INVALID,
+                    "Durable anti-exfil state is already locked in this process", e);
         } catch(IOException e) {
             throw new AntiExfilException(AntiExfilException.Code.STATE_INVALID,
                     "Cannot access durable anti-exfil state: " + e.getMessage(), e);
@@ -77,15 +101,35 @@ final class AntiExfilDurableFiles {
     }
 
     static byte[] read(Path path, int maximumBytes) throws IOException {
-        byte[] encoded = Files.readAllBytes(path);
-        if(encoded.length < 32 || encoded.length > maximumBytes) throw new IOException("State length is outside limits");
+        if(maximumBytes < 32) throw new IOException("State length limit is invalid");
+        byte[] encoded;
+        try(FileChannel channel = FileChannel.open(path, StandardOpenOption.READ)) {
+            long size = channel.size();
+            if(size < 32 || size > maximumBytes) throw new IOException("State length is outside limits");
+            encoded = new byte[Math.toIntExact(size)];
+            ByteBuffer buffer = ByteBuffer.wrap(encoded);
+            while(buffer.hasRemaining()) {
+                if(channel.read(buffer) < 0) throw new IOException("State was truncated while being read");
+            }
+            if(channel.read(ByteBuffer.allocate(1)) >= 0) {
+                throw new IOException("State grew while being read");
+            }
+        }
         byte[] body = Arrays.copyOf(encoded, encoded.length - 32);
         byte[] checksum = Arrays.copyOfRange(encoded, encoded.length - 32, encoded.length);
         if(!Arrays.equals(Sha256Hash.hash(body), checksum)) throw new IOException("State checksum mismatch");
         return body;
     }
 
-    static void write(Path path, byte[] body, boolean createOnly) throws IOException {
+    static void write(Path path, byte[] body, boolean createOnly, int maximumBytes) throws IOException {
+        write(path, body, createOnly, maximumBytes, AntiExfilDurableFiles::forceParentDirectory);
+    }
+
+    static void write(Path path, byte[] body, boolean createOnly, int maximumBytes,
+                      DirectoryBarrier directoryBarrier) throws IOException {
+        if(body == null || maximumBytes < 32 || body.length > maximumBytes - 32) {
+            throw new IOException("State length is outside limits");
+        }
         if(createOnly && Files.exists(path)) throw new IOException("State already exists");
         byte[] encoded = ByteBuffer.allocate(body.length + 32).put(body).put(Sha256Hash.hash(body)).array();
         Path absolute = path.toAbsolutePath();
@@ -105,6 +149,11 @@ final class AntiExfilDurableFiles {
                 channel.force(true);
             }
             try {
+                if(!createOnly && Files.exists(absolute)) {
+                    // Replacement detaches hard-link aliases. Invalidate and force the locked old inode
+                    // first so no detached alias retains a valid pre-transition security state.
+                    invalidate(absolute);
+                }
                 if(createOnly) {
                     Files.move(temporary, absolute, StandardCopyOption.ATOMIC_MOVE);
                 } else {
@@ -114,14 +163,55 @@ final class AntiExfilDurableFiles {
                 throw new IOException("Filesystem does not support atomic durable-state replacement", e);
             }
             moved = true;
+            try {
+                directoryBarrier.force(parent);
+            } catch(IOException e) {
+                // The new state is visible but did not cross the required durability barrier. Make it
+                // unreadable before failing so an exact retry cannot disclose data from that state.
+                try {
+                    invalidate(absolute);
+                } catch(IOException invalidationFailure) {
+                    e.addSuppressed(invalidationFailure);
+                }
+                throw e;
+            }
         } finally {
             if(!moved) Files.deleteIfExists(temporary);
         }
     }
 
+    private static void invalidate(Path path) throws IOException {
+        try(FileChannel channel = FileChannel.open(path, StandardOpenOption.WRITE,
+                StandardOpenOption.TRUNCATE_EXISTING)) {
+            channel.force(true);
+        }
+    }
+
+    private static void forceParentDirectory(Path parent) throws IOException {
+        try(FileChannel channel = FileChannel.open(parent, StandardOpenOption.READ)) {
+            channel.force(true);
+        } catch(UnsupportedOperationException | IOException e) {
+            if(!isWindows()) {
+                if(e instanceof IOException io) throw io;
+                throw new IOException("Filesystem does not support parent-directory durability", e);
+            }
+            // Java cannot portably open directory handles on Windows. File content forcing and atomic
+            // replacement still apply; crash-time directory-entry persistence is a documented residual.
+        }
+    }
+
+    private static boolean isWindows() {
+        return System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT).contains("windows");
+    }
+
     @FunctionalInterface
     interface IOAction<T> {
         T run() throws IOException;
+    }
+
+    @FunctionalInterface
+    interface DirectoryBarrier {
+        void force(Path parent) throws IOException;
     }
 
     private static final class LocalLock {

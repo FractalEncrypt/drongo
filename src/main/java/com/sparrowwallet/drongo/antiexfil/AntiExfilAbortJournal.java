@@ -62,7 +62,7 @@ public final class AntiExfilAbortJournal {
     private Journal loadOrCreate() throws IOException {
         if(!Files.exists(path)) {
             Journal journal = new Journal(walletIdentity, List.of());
-            AntiExfilDurableFiles.write(path, encode(journal), true);
+            AntiExfilDurableFiles.write(path, encode(journal), true, MAX_FILE_BYTES);
             return journal;
         }
         Journal journal = decode(AntiExfilDurableFiles.read(path, MAX_FILE_BYTES));
@@ -163,7 +163,7 @@ public final class AntiExfilAbortJournal {
             List<AbortEvent> updated = new ArrayList<>(journal.events);
             updated.add(event);
             journal = new Journal(walletIdentity, updated);
-            AntiExfilDurableFiles.write(path, encode(journal), false);
+            AntiExfilDurableFiles.write(path, encode(journal), false, MAX_FILE_BYTES);
             return event;
         }
     }

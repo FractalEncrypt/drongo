@@ -85,7 +85,7 @@ public final class AntiExfilCoordinator {
             State state = new State(Phase.COMMITMENTS_CREATED, coordinator.walletIdentity, originalPsbt,
                     AntiExfilCodec.encode(commit), null, null, null, null, rhos, journal.getDigest());
             return AntiExfilDurableFiles.locked(coordinator.sessionPath, () -> {
-                AntiExfilDurableFiles.write(coordinator.sessionPath, encode(state), true);
+                AntiExfilDurableFiles.write(coordinator.sessionPath, encode(state), true, MAX_STATE_BYTES);
                 return null;
             });
         });
@@ -157,7 +157,7 @@ public final class AntiExfilCoordinator {
             State accepted = new State(Phase.OPENINGS_ACCEPTED, state.walletIdentity, state.originalPsbt,
                     state.message1, encodedOpenings, message3, null, null, state.rhos, state.abortJournalDigest);
             // This durable write is the security boundary: no rho is returned before it succeeds.
-            AntiExfilDurableFiles.write(sessionPath, encode(accepted), false);
+            AntiExfilDurableFiles.write(sessionPath, encode(accepted), false, MAX_STATE_BYTES);
             return message3.clone();
         }));
     }
@@ -189,7 +189,7 @@ public final class AntiExfilCoordinator {
             State complete = new State(Phase.COMPLETE, state.walletIdentity, state.originalPsbt,
                     state.message1, state.message2, state.message3, encodedSignatures, signed, state.rhos,
                     state.abortJournalDigest);
-            AntiExfilDurableFiles.write(sessionPath, encode(complete), false);
+            AntiExfilDurableFiles.write(sessionPath, encode(complete), false, MAX_STATE_BYTES);
             return completion(complete);
         }));
     }
@@ -322,6 +322,10 @@ public final class AntiExfilCoordinator {
     }
 
     private static byte[] encode(State state) throws IOException {
+        int expectedFileLength = checkedStateFileLength(state.originalPsbt.length, state.message1.length,
+                nullableLength(state.message2), nullableLength(state.message3),
+                nullableLength(state.message4), nullableLength(state.signedPsbt),
+                nullableLength(state.abortJournalDigest), state.rhos.size(), MAX_STATE_BYTES);
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
         try(DataOutputStream output = new DataOutputStream(bytes)) {
             output.write(MAGIC);
@@ -342,7 +346,54 @@ public final class AntiExfilCoordinator {
                 output.write(entry.getValue());
             }
         }
-        return bytes.toByteArray();
+        byte[] body = bytes.toByteArray();
+        if(body.length != expectedFileLength - 32) {
+            throw new IOException("Encoded coordinator state length disagrees with its bounded schema");
+        }
+        return body;
+    }
+
+    static int checkedStateFileLength(int originalPsbtLength, int message1Length,
+                                      int message2Length, int message3Length, int message4Length,
+                                      int signedPsbtLength, int abortJournalDigestLength,
+                                      int rhoCount, int maximumFileBytes) throws IOException {
+        requireStoredLength(originalPsbtLength, MAX_PSBT_BYTES, false, "original PSBT");
+        requireStoredLength(message1Length, AntiExfilCodec.MAX_MESSAGE_BYTES, false, "message 1");
+        requireStoredLength(message2Length, AntiExfilCodec.MAX_MESSAGE_BYTES, true, "message 2");
+        requireStoredLength(message3Length, AntiExfilCodec.MAX_MESSAGE_BYTES, true, "message 3");
+        requireStoredLength(message4Length, AntiExfilCodec.MAX_MESSAGE_BYTES, true, "message 4");
+        requireStoredLength(signedPsbtLength, MAX_BLOB_BYTES, true, "signed PSBT");
+        if(abortJournalDigestLength != -1 && abortJournalDigestLength != 32) {
+            throw new IOException("Stored abort-journal digest length is outside limits");
+        }
+        if(rhoCount < 1 || rhoCount > AntiExfilCodec.MAX_SLOTS) {
+            throw new IOException("Stored host-randomness count is outside limits");
+        }
+
+        long valueBytes = positiveLength(originalPsbtLength) + positiveLength(message1Length)
+                + positiveLength(message2Length) + positiveLength(message3Length)
+                + positiveLength(message4Length) + positiveLength(signedPsbtLength)
+                + positiveLength(abortJournalDigestLength);
+        // Fixed state header, seven four-byte blob lengths, rho count, checksum, and 69 bytes per rho.
+        long fileBytes = 100L + valueBytes + (69L * rhoCount);
+        if(maximumFileBytes < 32 || fileBytes > maximumFileBytes) {
+            throw new IOException("Encoded coordinator state exceeds the durable file limit");
+        }
+        return Math.toIntExact(fileBytes);
+    }
+
+    private static void requireStoredLength(int length, int maximum, boolean nullable, String name)
+            throws IOException {
+        if((nullable && length == -1) || (length >= 1 && length <= maximum)) return;
+        throw new IOException("Stored " + name + " length is outside limits");
+    }
+
+    private static int nullableLength(byte[] value) {
+        return value == null ? -1 : value.length;
+    }
+
+    private static long positiveLength(int length) {
+        return length < 0 ? 0L : length;
     }
 
     private static State decode(byte[] body) throws IOException {
