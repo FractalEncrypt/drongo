@@ -171,6 +171,28 @@ class AntiExfilPsbtTest {
     }
 
     @Test
+    void witnessOnlyUtxoContextIsCommittedButNotOutpointAuthenticated() throws Exception {
+        PSBT original = AntiExfilPsbt.parseCanonicalV0(raw);
+        PSBTInput originalInput = original.getPsbtInputs().getFirst();
+        assertNull(originalInput.getNonWitnessUtxo());
+        assertNotNull(originalInput.getWitnessUtxo());
+        AntiExfilSigningSlot originalSlot = AntiExfilPsbt.enumerateSigningSlots(raw, keystore).stream()
+                .filter(slot -> slot.getInputIndex() == 0).findFirst().orElseThrow();
+
+        PSBT changed = new PSBT(raw, false);
+        PSBTInput changedInput = changed.getPsbtInputs().getFirst();
+        TransactionOutput witness = changedInput.getWitnessUtxo();
+        changedInput.setWitnessUtxo(new TransactionOutput(null, witness.getValue() + 1, witness.getScript()));
+        AntiExfilSigningSlot changedSlot = AntiExfilPsbt.enumerateSigningSlots(changed.serialize(), keystore).stream()
+                .filter(slot -> slot.getIdentifier().equals(originalSlot.getIdentifier()))
+                .findFirst().orElseThrow();
+
+        assertArrayEquals(original.getTransaction().getInputs().getFirst().getOutpoint().bitcoinSerialize(),
+                changed.getTransaction().getInputs().getFirst().getOutpoint().bitcoinSerialize());
+        assertFalse(Arrays.equals(originalSlot.getMessageHash(), changedSlot.getMessageHash()));
+    }
+
+    @Test
     void requiresExactUniqueRandomnessSet() {
         List<AntiExfilSigningSlot> slots = AntiExfilPsbt.enumerateSigningSlots(raw, keystore);
         Map<AntiExfilSigningSlot.Identifier, byte[]> rhos = deterministicRhos(slots);
