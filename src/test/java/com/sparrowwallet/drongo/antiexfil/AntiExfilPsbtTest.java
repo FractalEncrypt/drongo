@@ -10,6 +10,7 @@ import com.sparrowwallet.drongo.protocol.Sha256Hash;
 import com.sparrowwallet.drongo.protocol.SigHash;
 import com.sparrowwallet.drongo.protocol.TransactionOutput;
 import com.sparrowwallet.drongo.protocol.TransactionSignature;
+import com.sparrowwallet.drongo.protocol.TransactionWitness;
 import com.sparrowwallet.drongo.psbt.PSBT;
 import com.sparrowwallet.drongo.psbt.PSBTInput;
 import com.sparrowwallet.drongo.wallet.DeterministicSeed;
@@ -168,6 +169,24 @@ class AntiExfilPsbtTest {
                 new TransactionOutput(null, 103_000, ScriptType.P2TR.getOutputScript(key.getPubKeyXCoord()))));
         assertRejected(psbt -> psbt.getPsbtInputs().get(3).setWitnessUtxo(
                 new TransactionOutput(null, 103_000, ScriptType.P2PKH.getOutputScript(key.getPubKeyHash()))));
+    }
+
+    @Test
+    void rejectsFinalizedInputAttributableToControlledKey() {
+        PSBT psbt = AntiExfilPsbt.parseCanonicalV0(raw);
+        PSBTInput input = psbt.getPsbtInputs().getFirst();
+        ECKey key = input.getDerivedPublicKeys().keySet().iterator().next();
+        input.setFinalScriptWitness(new TransactionWitness(psbt.getTransaction(),
+                List.of("ordinary-signature".getBytes(StandardCharsets.US_ASCII), key.getPubKey())));
+
+        AntiExfilException rejected = assertThrows(AntiExfilException.class,
+                () -> AntiExfilPsbt.enumerateSigningSlots(psbt.serialize(), keystore));
+        assertEquals(AntiExfilException.Code.UNEXPECTED_RETURN_DATA, rejected.getCode());
+
+        input.getDerivedPublicKeys().put(key, new KeyDerivation(
+                "deadbeef", input.getDerivedPublicKeys().get(key).getDerivationPath()));
+        assertEquals(List.of(1, 2, 2, 3), AntiExfilPsbt.enumerateSigningSlots(
+                psbt.serialize(), keystore).stream().map(AntiExfilSigningSlot::getInputIndex).toList());
     }
 
     @Test

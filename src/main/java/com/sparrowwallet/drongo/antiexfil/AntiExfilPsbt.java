@@ -86,7 +86,10 @@ public final class AntiExfilPsbt {
                 if(input.getPartialSignatures().containsKey(publicKey)) {
                     throw fail(UNEXPECTED_RETURN_DATA, "Input " + index + " already has a controlled signature");
                 }
-                if(input.isFinalized()) continue;
+                if(input.isFinalized()) {
+                    throw fail(UNEXPECTED_RETURN_DATA,
+                            "Input " + index + " is finalized for a controlled key");
+                }
                 slots.add(new AntiExfilSigningSlot(index, publicKey.getPubKey(), messageHash,
                         AntiExfilCodec.SIGHASH_ALL, derivation, classification.kind()));
             }
