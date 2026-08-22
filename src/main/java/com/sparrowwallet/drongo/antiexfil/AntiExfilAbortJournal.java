@@ -1,5 +1,7 @@
 package com.sparrowwallet.drongo.antiexfil;
 
+import com.sparrowwallet.drongo.protocol.Sha256Hash;
+
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
@@ -28,15 +30,24 @@ public final class AntiExfilAbortJournal {
         if(path == null || walletIdentity == null || walletIdentity.length != 32) {
             throw new AntiExfilException(AntiExfilException.Code.STATE_INVALID, "Invalid abort-journal identity");
         }
-        this.path = path;
+        this.path = AntiExfilDurableFiles.canonicalPath(path);
         this.walletIdentity = walletIdentity.clone();
     }
 
     public List<AbortEvent> getEvents() {
-        return AntiExfilDurableFiles.locked(path, () -> List.copyOf(loadOrCreate().events));
+        return locked(LockedJournal::getEvents);
     }
 
     AbortEvent append(byte[] sessionId, byte[] psbtDigest, String reason) {
+        String normalizedReason = validateEvent(sessionId, psbtDigest, reason);
+        return locked(journal -> journal.append(sessionId, psbtDigest, normalizedReason));
+    }
+
+    <T> T locked(LockedAction<T> action) {
+        return AntiExfilDurableFiles.locked(path, () -> action.run(new LockedJournal(loadOrCreate())));
+    }
+
+    private static String validateEvent(byte[] sessionId, byte[] psbtDigest, String reason) {
         if(sessionId == null || sessionId.length != 32 || psbtDigest == null || psbtDigest.length != 32) {
             throw new AntiExfilException(AntiExfilException.Code.STATE_INVALID, "Invalid abort event context");
         }
@@ -45,16 +56,7 @@ public final class AntiExfilAbortJournal {
             throw new AntiExfilException(AntiExfilException.Code.STATE_INVALID,
                     "Abort reason must contain 1 to " + MAX_REASON_BYTES + " UTF-8 bytes");
         }
-        return AntiExfilDurableFiles.locked(path, () -> {
-            Journal journal = loadOrCreate();
-            if(journal.events.size() >= MAX_EVENTS) throw new IOException("Abort journal is full");
-            AbortEvent event = new AbortEvent(sessionId, psbtDigest, Instant.now().getEpochSecond(),
-                    new String(reasonBytes, StandardCharsets.UTF_8));
-            List<AbortEvent> updated = new ArrayList<>(journal.events);
-            updated.add(event);
-            AntiExfilDurableFiles.write(path, encode(new Journal(walletIdentity, updated)), false);
-            return event;
-        });
+        return new String(reasonBytes, StandardCharsets.UTF_8);
     }
 
     private Journal loadOrCreate() throws IOException {
@@ -131,6 +133,51 @@ public final class AntiExfilAbortJournal {
         public byte[] getPsbtDigest() { return psbtDigest.clone(); }
         public long getRecordedAtEpochSecond() { return recordedAtEpochSecond; }
         public String getReason() { return reason; }
+    }
+
+    final class LockedJournal {
+        private Journal journal;
+
+        private LockedJournal(Journal loaded) {
+            List<AbortEvent> unique = new ArrayList<>();
+            for(AbortEvent candidate : loaded.events) {
+                if(findBySession(unique, candidate.sessionId) == null) unique.add(candidate);
+            }
+            this.journal = new Journal(loaded.walletIdentity, unique);
+        }
+
+        List<AbortEvent> getEvents() {
+            return List.copyOf(journal.events);
+        }
+
+        byte[] getDigest() throws IOException {
+            return Sha256Hash.hash(encode(journal));
+        }
+
+        AbortEvent append(byte[] sessionId, byte[] psbtDigest, String reason) throws IOException {
+            String normalizedReason = validateEvent(sessionId, psbtDigest, reason);
+            AbortEvent existing = findBySession(journal.events, sessionId);
+            if(existing != null) return existing;
+            if(journal.events.size() >= MAX_EVENTS) throw new IOException("Abort journal is full");
+            AbortEvent event = new AbortEvent(sessionId, psbtDigest, Instant.now().getEpochSecond(), normalizedReason);
+            List<AbortEvent> updated = new ArrayList<>(journal.events);
+            updated.add(event);
+            journal = new Journal(walletIdentity, updated);
+            AntiExfilDurableFiles.write(path, encode(journal), false);
+            return event;
+        }
+    }
+
+    private static AbortEvent findBySession(List<AbortEvent> events, byte[] sessionId) {
+        for(AbortEvent event : events) {
+            if(Arrays.equals(event.sessionId, sessionId)) return event;
+        }
+        return null;
+    }
+
+    @FunctionalInterface
+    interface LockedAction<T> {
+        T run(LockedJournal journal) throws IOException;
     }
 
     private record Journal(byte[] walletIdentity, List<AbortEvent> events) {
