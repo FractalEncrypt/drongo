@@ -2,6 +2,7 @@ package com.sparrowwallet.drongo.antiexfil;
 
 import com.sparrowwallet.drongo.KeyDerivation;
 import com.sparrowwallet.drongo.Utils;
+import com.sparrowwallet.drongo.crypto.ECKey;
 import com.sparrowwallet.drongo.policy.PolicyType;
 import com.sparrowwallet.drongo.protocol.TransactionSignature;
 import com.sparrowwallet.drongo.psbt.PSBT;
@@ -12,7 +13,9 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.InputStream;
+import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.SecureRandom;
 import java.util.Arrays;
@@ -63,6 +66,36 @@ class AntiExfilMixedProvenanceTest {
                 .filter(signature -> Arrays.equals(signature, Utils.hexToBytes(field(vector, "ordinary_signature_der"))))
                 .count();
         assertEquals(1, ordinaryMatches);
+    }
+
+    @Test
+    void rejectsInvalidForeignPartialBeforeCreatingCoordinatorState() throws Exception {
+        String vector;
+        try(InputStream stream = getClass().getResourceAsStream("protocol-v1-mixed-provenance-vector.json")) {
+            assertNotNull(stream);
+            vector = new String(stream.readAllBytes(), StandardCharsets.UTF_8);
+        }
+        byte[] original = Utils.hexToBytes(field(vector, "original_psbt_hex"));
+        PSBT doctored = new PSBT(original, false);
+        ECKey foreignKey = doctored.getPsbtInputs().getFirst().getPartialSignatures().keySet().iterator().next();
+        doctored.getPsbtInputs().getFirst().getPartialSignatures().put(foreignKey,
+                new TransactionSignature(BigInteger.ONE, BigInteger.ONE, TransactionSignature.Type.ECDSA));
+        byte[] invalid = doctored.serialize();
+
+        DeterministicSeed seed = new DeterministicSeed(field(vector, "mnemonic"), "", 0,
+                DeterministicSeed.Type.BIP39);
+        Keystore signerA = Keystore.fromSeed(seed, PolicyType.MULTI_HD,
+                KeyDerivation.parsePath(field(vector, "account_derivation")));
+        signerA.setAntiExfilPolicy(AntiExfilKeystorePolicy.REQUIRED);
+        Path session = temporary.resolve("invalid-foreign.aexs");
+        Path journal = temporary.resolve("invalid-foreign.aexj");
+
+        AntiExfilException rejected = assertThrows(AntiExfilException.class,
+                () -> AntiExfilCoordinator.create(session, journal, invalid, signerA,
+                        AntiExfilNetwork.TESTNET4, false, new MixedVectorRandom()));
+        assertEquals(AntiExfilException.Code.INVALID_MESSAGE, rejected.getCode());
+        assertFalse(Files.exists(session));
+        assertFalse(Files.exists(journal));
     }
 
     private static String field(String vector, String name) {

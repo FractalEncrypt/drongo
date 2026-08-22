@@ -35,7 +35,9 @@ public final class AntiExfilPsbt {
             throw fail(INVALID_MESSAGE, "Invalid PSBT magic");
         }
         try {
-            PSBT psbt = new PSBT(raw, false);
+            // Valid foreign multisig partials are preserved, but an invalid one would consume
+            // a protected ceremony only to produce a PSBT that downstream combine rejects.
+            PSBT psbt = new PSBT(raw, true);
             if(psbt.getVersion() != null && psbt.getVersion() != 0) {
                 throw fail(INVALID_MESSAGE, "Protocol v1 accepts PSBT v0 only");
             }
