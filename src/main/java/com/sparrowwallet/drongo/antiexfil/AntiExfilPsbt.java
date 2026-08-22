@@ -127,6 +127,7 @@ public final class AntiExfilPsbt {
     }
 
     public static byte[] reconstructSignedPsbt(byte[] original, Keystore keystore, AntiExfilMessage commit,
+                                               AntiExfilMessage openings, AntiExfilMessage reveal,
                                                AntiExfilMessage signatures,
                                                Map<AntiExfilSigningSlot.Identifier, byte[]> hostRandomness) {
         List<AntiExfilSigningSlot> semantic = enumerateSigningSlots(original, keystore);
@@ -136,6 +137,8 @@ public final class AntiExfilPsbt {
             throw fail(SIGNATURE_SLOT_MISMATCH, "Stored host randomness differs from the authoritative slot set");
         }
         AntiExfilCodec.validate(commit);
+        AntiExfilCodec.validate(openings);
+        AntiExfilCodec.validate(reveal);
         AntiExfilCodec.validate(signatures);
         if(commit == null || commit.getStage() != AntiExfilStage.HOST_COMMIT
                 || !Arrays.equals(commit.getPsbtDigest(), Sha256Hash.hash(original))
@@ -145,21 +148,20 @@ public final class AntiExfilPsbt {
         if(signatures == null || signatures.getStage() != AntiExfilStage.SIGNER_SIGNATURES) {
             throw fail(WRONG_STAGE, "Expected signer-signatures message");
         }
-        if(signatures.getNetwork() != commit.getNetwork()
-                || !Arrays.equals(signatures.getSessionId(), commit.getSessionId())
-                || !Arrays.equals(signatures.getPsbtDigest(), commit.getPsbtDigest())
-                || signatures.getSlots().size() != semantic.size()) {
-            throw fail(TRANSACTION_MISMATCH, "Signature response context changed");
-        }
+        AntiExfilCodec.validateTransition(commit, openings);
+        AntiExfilCodec.validateTransition(openings, reveal);
+        AntiExfilCodec.validateTransition(reveal, signatures);
+        if(signatures.getSlots().size() != semantic.size()) throw fail(TRANSACTION_MISMATCH, "Signature response context changed");
         PSBT reconstructed = parseCanonicalV0(original);
         for(int i = 0; i < semantic.size(); i++) {
             AntiExfilSigningSlot authoritative = semantic.get(i);
             AntiExfilSlot before = commit.getSlots().get(i);
+            AntiExfilSlot revealed = reveal.getSlots().get(i);
             AntiExfilSlot after = signatures.getSlots().get(i);
             byte[] rho = hostRandomness == null ? null : hostRandomness.get(authoritative.getIdentifier());
             requireSlot(authoritative, before);
             requireSlot(authoritative, after);
-            if(!Arrays.equals(before.getCommitment(), after.getCommitment()) || rho == null
+            if(rho == null || !Arrays.equals(rho, revealed.getHostRandomness())
                     || !Arrays.equals(AntiExfilCrypto.hostCommit(rho), before.getCommitment())) {
                 throw fail(COMMITMENT_MISMATCH, "Stored randomness or response commitment changed");
             }

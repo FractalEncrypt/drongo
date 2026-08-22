@@ -86,8 +86,10 @@ class AntiExfilPsbtTest {
         List<AntiExfilSigningSlot> slots = AntiExfilPsbt.enumerateSigningSlots(raw, keystore);
         Map<AntiExfilSigningSlot.Identifier, byte[]> rhos = deterministicRhos(slots);
         AntiExfilMessage commit = AntiExfilCodec.decode(Utils.hexToBytes(field("message_1_hex")));
+        AntiExfilMessage openings = AntiExfilCodec.decode(Utils.hexToBytes(field("message_2_hex")));
+        AntiExfilMessage reveal = AntiExfilCodec.decode(Utils.hexToBytes(field("message_3_hex")));
         AntiExfilMessage signatures = AntiExfilCodec.decode(Utils.hexToBytes(field("message_4_hex")));
-        byte[] signed = AntiExfilPsbt.reconstructSignedPsbt(raw, keystore, commit, signatures, rhos);
+        byte[] signed = AntiExfilPsbt.reconstructSignedPsbt(raw, keystore, commit, openings, reveal, signatures, rhos);
         assertEquals(field("signed_psbt_sha256"), Utils.bytesToHex(Sha256Hash.hash(signed)));
         PSBT parsed = AntiExfilPsbt.parseCanonicalV0(signed);
         assertEquals(5, parsed.getPsbtInputs().stream().mapToInt(input -> input.getPartialSignatures().size()).sum());
@@ -98,12 +100,24 @@ class AntiExfilPsbtTest {
         AntiExfilMessage truncated = new AntiExfilMessage(signatures.getNetwork(), signatures.getStage(),
                 signatures.getSessionId(), signatures.getPsbtDigest(), incomplete);
         assertThrows(AntiExfilException.class,
-                () -> AntiExfilPsbt.reconstructSignedPsbt(raw, keystore, commit, truncated, rhos));
+                () -> AntiExfilPsbt.reconstructSignedPsbt(raw, keystore, commit, openings, reveal, truncated, rhos));
 
         Map<AntiExfilSigningSlot.Identifier, byte[]> extra = new LinkedHashMap<>(rhos);
         extra.put(new AntiExfilSigningSlot.Identifier(99, ECKey.fromPrivate(BigInteger.valueOf(99)).getPubKey()), repeat((byte)99));
         assertThrows(AntiExfilException.class,
-                () -> AntiExfilPsbt.reconstructSignedPsbt(raw, keystore, commit, signatures, extra));
+                () -> AntiExfilPsbt.reconstructSignedPsbt(raw, keystore, commit, openings, reveal, signatures, extra));
+
+        List<AntiExfilSlot> changedOpenings = new ArrayList<>(openings.getSlots());
+        AntiExfilSlot first = changedOpenings.getFirst();
+        changedOpenings.set(0, new AntiExfilSlot(first.getInputIndex(), first.getSighashType(),
+                first.getSignerPublicKey(), first.getMessageHash(), first.getCommitment(),
+                changedOpenings.get(1).getOpening(), null, null));
+        AntiExfilMessage substitutedOpenings = new AntiExfilMessage(openings.getNetwork(), openings.getStage(),
+                openings.getSessionId(), openings.getPsbtDigest(), changedOpenings);
+        AntiExfilException openingMismatch = assertThrows(AntiExfilException.class,
+                () -> AntiExfilPsbt.reconstructSignedPsbt(raw, keystore, commit, substitutedOpenings,
+                        reveal, signatures, rhos));
+        assertEquals(AntiExfilException.Code.OPENING_MISMATCH, openingMismatch.getCode());
     }
 
     @Test

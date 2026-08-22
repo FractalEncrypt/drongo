@@ -87,6 +87,10 @@ public final class AntiExfilCodec {
     }
 
     public static void validateTransition(AntiExfilMessage previous, AntiExfilMessage current) {
+        // This is a public object-form boundary: callers are not required to have
+        // obtained either endpoint through decode(), so validate both in full.
+        validate(previous);
+        validate(current);
         if(current.getStage().getCode() != previous.getStage().getCode() + 1) throw fail(WRONG_STAGE, "Stages are not adjacent");
         if(previous.getNetwork() != current.getNetwork()
                 || !Arrays.equals(previous.getSessionId(), current.getSessionId())
