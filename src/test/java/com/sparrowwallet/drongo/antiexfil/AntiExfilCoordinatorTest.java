@@ -153,14 +153,18 @@ class AntiExfilCoordinatorTest {
         AntiExfilCoordinator coordinator = create(session);
         assertThrows(AntiExfilException.class, () -> coordinator.recordPostRevealAbort(AntiExfilCoordinator.AbortReason.USER_ABANDONED));
         coordinator.acceptOpenings(message2);
-        coordinator.recordPostRevealAbort(AntiExfilCoordinator.AbortReason.SIGNER_CANCELLED);
-        coordinator.recordPostRevealAbort(AntiExfilCoordinator.AbortReason.TRANSPORT_FAILED);
+        AntiExfilAbortJournal.AbortEvent first = coordinator.recordPostRevealAbort(
+                AntiExfilCoordinator.AbortReason.SIGNER_CANCELLED);
+        AntiExfilAbortJournal.AbortEvent duplicate = coordinator.recordPostRevealAbort(
+                AntiExfilCoordinator.AbortReason.TRANSPORT_FAILED);
+        assertEquals(first.getRecordedAtEpochSecond(), duplicate.getRecordedAtEpochSecond());
+        assertEquals(AntiExfilCoordinator.AbortReason.SIGNER_CANCELLED.name(), duplicate.getReason());
 
         AntiExfilCoordinator reloaded = AntiExfilCoordinator.load(session, journal, keystore);
-        assertEquals(2, reloaded.getStatus().getPostRevealAbortCount());
+        assertEquals(1, reloaded.getStatus().getPostRevealAbortCount());
         List<AntiExfilAbortJournal.AbortEvent> events = new AntiExfilAbortJournal(journal,
                 walletIdentityForTest(keystore)).getEvents();
-        assertEquals(2, events.size());
+        assertEquals(1, events.size());
         assertArrayEquals(AntiExfilCodec.decode(message1).getSessionId(), events.getFirst().getSessionId());
 
         Path fresh = temporary.resolve("fresh.aexs");
@@ -170,7 +174,7 @@ class AntiExfilCoordinatorTest {
         assertFalse(Files.exists(fresh));
         AntiExfilCoordinator acknowledged = AntiExfilCoordinator.create(
                 fresh, journal, raw, keystore, AntiExfilNetwork.TESTNET4, true, new VectorRandom());
-        assertEquals(2, acknowledged.getStatus().getPostRevealAbortCount());
+        assertEquals(1, acknowledged.getStatus().getPostRevealAbortCount());
     }
 
     @Test
