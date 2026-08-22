@@ -15,7 +15,10 @@ import java.util.Set;
 import static com.sparrowwallet.drongo.antiexfil.AntiExfilException.Code.*;
 
 public final class AntiExfilCodec {
-    public static final byte[] MAGIC = {'A', 'E', 'X', 'B'};
+    private static final byte[] WIRE_MAGIC = {'A', 'E', 'X', 'B'};
+    /** @deprecated Use the codec rather than mutable framing bytes. Kept only for source compatibility. */
+    @Deprecated
+    public static final byte[] MAGIC = WIRE_MAGIC.clone();
     public static final int FORMAT_VERSION = 1;
     public static final long SIGHASH_ALL = 1;
     public static final int MAX_SLOTS = 128;
@@ -31,7 +34,7 @@ public final class AntiExfilCodec {
         validate(message);
         int payloadLength = Math.multiplyExact(message.getSlots().size(), message.getStage().getRecordLength());
         ByteBuffer buffer = ByteBuffer.allocate(HEADER_LENGTH + payloadLength);
-        buffer.put(MAGIC).put((byte)FORMAT_VERSION).put((byte)message.getNetwork().getCode())
+        buffer.put(WIRE_MAGIC).put((byte)FORMAT_VERSION).put((byte)message.getNetwork().getCode())
                 .put((byte)message.getStage().getCode()).put((byte)0).putInt(payloadLength)
                 .put(message.getSessionId()).put(message.getPsbtDigest()).putShort((short)message.getSlots().size());
         for(AntiExfilSlot slot : message.getSlots()) {
@@ -51,7 +54,7 @@ public final class AntiExfilCodec {
         ByteBuffer buffer = ByteBuffer.wrap(encoded);
         byte[] magic = new byte[4];
         buffer.get(magic);
-        if(!Arrays.equals(magic, MAGIC)) throw fail(INVALID_MESSAGE, "Wrong AEXB magic");
+        if(!Arrays.equals(magic, WIRE_MAGIC)) throw fail(INVALID_MESSAGE, "Wrong AEXB magic");
         if(Byte.toUnsignedInt(buffer.get()) != FORMAT_VERSION) throw fail(INVALID_MESSAGE, "Unsupported AEXB version");
         AntiExfilNetwork network = AntiExfilNetwork.fromCode(Byte.toUnsignedInt(buffer.get()));
         AntiExfilStage stage = AntiExfilStage.fromCode(Byte.toUnsignedInt(buffer.get()));

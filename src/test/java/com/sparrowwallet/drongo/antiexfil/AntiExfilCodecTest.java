@@ -83,6 +83,21 @@ class AntiExfilCodecTest {
     }
 
     @Test
+    void publicMagicMutationCannotChangeCanonicalFraming() throws IOException {
+        byte[] canonical = loadMessageVectors().getFirst();
+        byte original = AntiExfilCodec.MAGIC[0];
+        try {
+            AntiExfilCodec.MAGIC[0] ^= 0x20;
+            AntiExfilMessage decoded = assertDoesNotThrow(() -> AntiExfilCodec.decode(canonical));
+            assertArrayEquals(canonical, AntiExfilCodec.encode(decoded));
+            assertArrayEquals(new byte[]{'A', 'E', 'X', 'B'},
+                    Arrays.copyOf(AntiExfilCodec.encode(decoded), 4));
+        } finally {
+            AntiExfilCodec.MAGIC[0] = original;
+        }
+    }
+
+    @Test
     void openingsMustBeUniquePerSignerKey() throws IOException {
         AntiExfilMessage openings = AntiExfilCodec.decode(loadMessageVectors().get(1));
         AntiExfilSlot first = openings.getSlots().get(0);
