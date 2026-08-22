@@ -7,6 +7,7 @@ import com.sparrowwallet.drongo.protocol.Sha256Hash;
 import com.sparrowwallet.drongo.wallet.DeterministicSeed;
 import com.sparrowwallet.drongo.wallet.Keystore;
 import com.sparrowwallet.drongo.wallet.MnemonicException;
+import com.sparrowwallet.drongo.wallet.AntiExfilKeystorePolicy;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -59,6 +60,7 @@ class AntiExfilAbortStateMachineTest {
         message4 = Utils.hexToBytes(field("message_4_hex"));
         DeterministicSeed seed = new DeterministicSeed(WORDS, "", 0, DeterministicSeed.Type.BIP39);
         keystore = Keystore.fromSeed(seed, PolicyType.SINGLE_HD, KeyDerivation.parsePath("m/84'/1'/0'"));
+        keystore.setAntiExfilPolicy(AntiExfilKeystorePolicy.OPTIONAL);
         journal = temporary.resolve("wallet.aexj");
     }
 

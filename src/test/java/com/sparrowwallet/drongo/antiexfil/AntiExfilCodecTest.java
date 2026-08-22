@@ -83,6 +83,28 @@ class AntiExfilCodecTest {
     }
 
     @Test
+    void transitionValidationFullyValidatesBothObjectEndpoints() throws IOException {
+        List<AntiExfilMessage> messages = loadMessageVectors().stream().map(AntiExfilCodec::decode).toList();
+        AntiExfilMessage commit = messages.get(0);
+        AntiExfilMessage openings = messages.get(1);
+        AntiExfilMessage malformedPrevious = new AntiExfilMessage(commit.getNetwork(), commit.getStage(), null,
+                commit.getPsbtDigest(), commit.getSlots());
+        AntiExfilMessage malformedCurrent = new AntiExfilMessage(openings.getNetwork(), openings.getStage(),
+                openings.getSessionId(), openings.getPsbtDigest(), null);
+
+        assertEquals(AntiExfilException.Code.INVALID_MESSAGE,
+                assertThrows(AntiExfilException.class,
+                        () -> AntiExfilCodec.validateTransition(malformedPrevious, openings)).getCode());
+        assertEquals(AntiExfilException.Code.INVALID_MESSAGE,
+                assertThrows(AntiExfilException.class,
+                        () -> AntiExfilCodec.validateTransition(commit, malformedCurrent)).getCode());
+        assertEquals(AntiExfilException.Code.INVALID_MESSAGE,
+                assertThrows(AntiExfilException.class,
+                        () -> AntiExfilCodec.validateTransition(null, openings)).getCode());
+        assertDoesNotThrow(() -> AntiExfilCodec.validateTransition(commit, openings));
+    }
+
+    @Test
     void publicMagicMutationCannotChangeCanonicalFraming() throws IOException {
         byte[] canonical = loadMessageVectors().getFirst();
         byte original = AntiExfilCodec.MAGIC[0];

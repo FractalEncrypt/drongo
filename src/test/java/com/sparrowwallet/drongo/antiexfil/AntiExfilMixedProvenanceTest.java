@@ -7,6 +7,7 @@ import com.sparrowwallet.drongo.protocol.TransactionSignature;
 import com.sparrowwallet.drongo.psbt.PSBT;
 import com.sparrowwallet.drongo.wallet.DeterministicSeed;
 import com.sparrowwallet.drongo.wallet.Keystore;
+import com.sparrowwallet.drongo.wallet.AntiExfilKeystorePolicy;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -39,6 +40,7 @@ class AntiExfilMixedProvenanceTest {
         DeterministicSeed seed = new DeterministicSeed(field(vector, "mnemonic"), "", 0, DeterministicSeed.Type.BIP39);
         Keystore signerA = Keystore.fromSeed(seed, PolicyType.MULTI_HD,
                 KeyDerivation.parsePath(field(vector, "account_derivation")));
+        signerA.setAntiExfilPolicy(AntiExfilKeystorePolicy.REQUIRED);
         Path session = temporary.resolve("mixed.aexs");
         Path journal = temporary.resolve("mixed.aexj");
 

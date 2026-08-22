@@ -61,6 +61,9 @@ public final class AntiExfilCoordinator {
     static AntiExfilCoordinator create(Path sessionPath, Path journalPath, byte[] originalPsbt,
                                         Keystore keystore, AntiExfilNetwork network,
                                         boolean acknowledgePostRevealAbortRisk, SecureRandom random) {
+        if(keystore == null || !keystore.supportsAntiExfil()) {
+            throw fail(STATE_INVALID, "Keystore does not support anti-exfil signing");
+        }
         AntiExfilCoordinator coordinator = new AntiExfilCoordinator(sessionPath, journalPath, keystore);
         if(originalPsbt == null || originalPsbt.length > MAX_PSBT_BYTES || network == null || random == null) {
             throw fail(INVALID_MESSAGE, "Invalid coordinator initialization");
@@ -178,7 +181,8 @@ public final class AntiExfilCoordinator {
                 if(signatures.getStage() != AntiExfilStage.SIGNER_SIGNATURES) throw fail(WRONG_STAGE, "Expected signer signatures");
                 AntiExfilCodec.validateTransition(reveal, signatures);
                 signed = AntiExfilPsbt.reconstructSignedPsbt(state.originalPsbt, keystore,
-                        AntiExfilCodec.decode(state.message1), signatures, state.rhos);
+                        AntiExfilCodec.decode(state.message1), AntiExfilCodec.decode(state.message2), reveal,
+                        signatures, state.rhos);
             } catch(AntiExfilException e) {
                 if(isSignerDataRejection(e)) {
                     AntiExfilMessage commit = AntiExfilCodec.decode(state.message1);
@@ -201,10 +205,12 @@ public final class AntiExfilCoordinator {
     private Set<VerifiedAntiExfilSignature> deriveVerifiedSignatures(State state) {
         if(state.phase != Phase.COMPLETE || state.message4 == null || state.signedPsbt == null) invalidPhase();
         AntiExfilMessage commit = AntiExfilCodec.decode(state.message1);
+        AntiExfilMessage openings = AntiExfilCodec.decode(state.message2);
+        AntiExfilMessage reveal = AntiExfilCodec.decode(state.message3);
         AntiExfilMessage signatures = AntiExfilCodec.decode(state.message4);
         List<AntiExfilSigningSlot> semantic = AntiExfilPsbt.enumerateSigningSlots(state.originalPsbt, keystore);
         byte[] reconstructed = AntiExfilPsbt.reconstructSignedPsbt(state.originalPsbt, keystore,
-                commit, signatures, state.rhos);
+                commit, openings, reveal, signatures, state.rhos);
         if(!Arrays.equals(reconstructed, state.signedPsbt)) {
             throw fail(STATE_INVALID, "Verified-signature evidence does not reconstruct the stored signed PSBT");
         }
@@ -300,7 +306,8 @@ public final class AntiExfilCoordinator {
         if(state.message4 == null || state.signedPsbt == null) invalidPhase();
         AntiExfilMessage signatures = AntiExfilCodec.decode(state.message4);
         AntiExfilCodec.validateTransition(reveal, signatures);
-        byte[] rebuiltSigned = AntiExfilPsbt.reconstructSignedPsbt(state.originalPsbt, keystore, commit, signatures, state.rhos);
+        byte[] rebuiltSigned = AntiExfilPsbt.reconstructSignedPsbt(state.originalPsbt, keystore,
+                commit, openings, reveal, signatures, state.rhos);
         if(!Arrays.equals(rebuiltSigned, state.signedPsbt)) throw fail(STATE_INVALID, "Stored signed PSBT is not reconstructible from verified signatures");
     }
 

@@ -18,9 +18,9 @@ public final class VerifiedAntiExfilSignature {
     private final long sighashType;
     private final byte[] compactSignature;
 
-    public VerifiedAntiExfilSignature(byte[] sessionId, byte[] originalPsbtDigest, byte[] walletKeyIdentity,
-                                      int inputIndex, byte[] outpoint, byte[] signerPublicKey, byte[] messageHash,
-                                      long sighashType, byte[] compactSignature) {
+    VerifiedAntiExfilSignature(byte[] sessionId, byte[] originalPsbtDigest, byte[] walletKeyIdentity,
+                               int inputIndex, byte[] outpoint, byte[] signerPublicKey, byte[] messageHash,
+                               long sighashType, byte[] compactSignature) {
         requireLength(sessionId, 32, "session ID");
         requireLength(originalPsbtDigest, 32, "original PSBT digest");
         requireLength(walletKeyIdentity, 32, "wallet-key identity");

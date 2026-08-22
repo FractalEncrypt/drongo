@@ -6,6 +6,7 @@ import com.sparrowwallet.drongo.policy.PolicyType;
 import com.sparrowwallet.drongo.protocol.Sha256Hash;
 import com.sparrowwallet.drongo.wallet.DeterministicSeed;
 import com.sparrowwallet.drongo.wallet.Keystore;
+import com.sparrowwallet.drongo.wallet.AntiExfilKeystorePolicy;
 import com.sparrowwallet.drongo.wallet.MnemonicException;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -117,6 +118,7 @@ class AntiExfilCoordinatorTest {
 
     @Test
     void derivesIdenticalImmutableSignatureProofsAtCompletionAndAfterReload() {
+        assertEquals(0, VerifiedAntiExfilSignature.class.getConstructors().length);
         AntiExfilCoordinator coordinator = create(session);
         coordinator.acceptOpenings(message2);
         AntiExfilCoordinator.Completion completed = coordinator.complete(message4);
@@ -146,6 +148,30 @@ class AntiExfilCoordinatorTest {
         AntiExfilCoordinator reloaded = AntiExfilCoordinator.load(session, journal, keystore);
         assertEquals(fresh, reloaded.getCompletedResult().getVerifiedSignatures());
         assertEquals(fresh, reloaded.complete(message4).getVerifiedSignatures());
+    }
+
+    @Test
+    void admitsOnlySupportedNewSessionsButPreservesCompletedEvidenceAfterPolicyChange() {
+        Keystore unsupported = keystore.copy();
+        unsupported.setAntiExfilPolicy(AntiExfilKeystorePolicy.UNSUPPORTED);
+        Path unsupportedSession = temporary.resolve("unsupported.aexs");
+        AntiExfilException rejected = assertThrows(AntiExfilException.class,
+                () -> AntiExfilCoordinator.create(unsupportedSession, temporary.resolve("unsupported.aexj"),
+                        raw, unsupported, AntiExfilNetwork.TESTNET4));
+        assertEquals(AntiExfilException.Code.STATE_INVALID, rejected.getCode());
+        assertFalse(Files.exists(unsupportedSession));
+
+        Keystore required = keystore.copy();
+        required.setAntiExfilPolicy(AntiExfilKeystorePolicy.REQUIRED);
+        assertDoesNotThrow(() -> AntiExfilCoordinator.create(temporary.resolve("required.aexs"),
+                temporary.resolve("required.aexj"), raw, required, AntiExfilNetwork.TESTNET4));
+
+        AntiExfilCoordinator completed = create(session);
+        completed.acceptOpenings(message2);
+        Set<VerifiedAntiExfilSignature> evidence = completed.complete(message4).getVerifiedSignatures();
+        keystore.setAntiExfilPolicy(AntiExfilKeystorePolicy.UNSUPPORTED);
+        assertEquals(evidence, AntiExfilCoordinator.load(session, journal, keystore)
+                .getCompletedResult().getVerifiedSignatures());
     }
 
     @Test
@@ -211,7 +237,9 @@ class AntiExfilCoordinatorTest {
 
     private static Keystore keystore(String words) throws MnemonicException {
         DeterministicSeed seed = new DeterministicSeed(words, "", 0, DeterministicSeed.Type.BIP39);
-        return Keystore.fromSeed(seed, PolicyType.SINGLE_HD, KeyDerivation.parsePath("m/84'/1'/0'"));
+        Keystore keystore = Keystore.fromSeed(seed, PolicyType.SINGLE_HD, KeyDerivation.parsePath("m/84'/1'/0'"));
+        keystore.setAntiExfilPolicy(AntiExfilKeystorePolicy.OPTIONAL);
+        return keystore;
     }
 
     private static byte[] repeat(byte value) {
