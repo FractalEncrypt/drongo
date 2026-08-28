@@ -19,15 +19,25 @@ public class KeystoreTest {
         Keystore keystore = new Keystore();
         keystore.setWalletModel(WalletModel.SPECTER_DIY);
         keystore.setAntiExfilPolicy(AntiExfilKeystorePolicy.REQUIRED);
+        keystore.setAntiExfilProfile(AntiExfilProfile.AEXT_V1);
 
         Keystore copy = keystore.copy();
         Assertions.assertTrue(copy.isAntiExfilRequired());
         Assertions.assertTrue(copy.supportsAntiExfil());
         Assertions.assertEquals(AntiExfilKeystorePolicy.REQUIRED, copy.getAntiExfilPolicy());
         Assertions.assertEquals(WalletModel.SPECTER_DIY, copy.getWalletModel());
+        Assertions.assertEquals(AntiExfilProfile.AEXT_V1, copy.getAntiExfilProfile());
 
         copy.setAntiExfilRequired(false);
         Assertions.assertEquals(AntiExfilKeystorePolicy.OPTIONAL, copy.getAntiExfilPolicy());
+    }
+
+    @Test
+    public void kernModelIsAppendedAndProfileIdsAreStable() {
+        Assertions.assertEquals(WalletModel.values().length - 1, WalletModel.KERN.ordinal());
+        Assertions.assertEquals("Kern", WalletModel.KERN.toDisplayString());
+        Assertions.assertEquals(AntiExfilProfile.AEXT_V1,
+                AntiExfilProfile.fromId("aext-v1"));
     }
 
     @Test
