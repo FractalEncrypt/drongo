@@ -34,7 +34,8 @@ public class KeystoreTest {
 
     @Test
     public void kernModelIsAppendedAndProfileIdsAreStable() {
-        Assertions.assertEquals(WalletModel.values().length - 1, WalletModel.KERN.ordinal());
+        Assertions.assertEquals(44, WalletModel.ERA_WALLET.ordinal(), "existing persisted ordinals must not move");
+        Assertions.assertEquals(45, WalletModel.KERN.ordinal(), "Kern is append-only in the persisted enum");
         Assertions.assertEquals("Kern", WalletModel.KERN.toDisplayString());
         Assertions.assertEquals(AntiExfilProfile.AEXT_V1,
                 AntiExfilProfile.fromId("aext-v1"));
