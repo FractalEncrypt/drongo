@@ -18,7 +18,7 @@ public enum AntiExfilProfile {
 
     public static AntiExfilProfile fromId(String id) {
         for(AntiExfilProfile profile : values()) {
-            if(profile.id.equals(id)) {
+            if(profile.id.equals(id) || profile.name().equals(id)) {
                 return profile;
             }
         }

@@ -39,6 +39,10 @@ public class KeystoreTest {
         Assertions.assertEquals("Kern", WalletModel.KERN.toDisplayString());
         Assertions.assertEquals(AntiExfilProfile.AEXT_V1,
                 AntiExfilProfile.fromId("aext-v1"));
+        Assertions.assertEquals(AntiExfilProfile.AEXT_V1,
+                AntiExfilProfile.fromId("AEXT_V1"), "temporary enum-name persistence remains readable");
+        Assertions.assertThrows(IllegalArgumentException.class,
+                () -> AntiExfilProfile.fromId("unknown-profile"));
     }
 
     @Test
