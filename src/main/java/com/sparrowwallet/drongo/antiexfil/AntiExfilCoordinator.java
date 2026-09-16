@@ -264,6 +264,11 @@ public final class AntiExfilCoordinator {
     }
 
     private State readValidatedState() {
+        // An absent session is a pure validation failure. Check before acquiring the
+        // durable lock because opening the lock sidecar necessarily creates it.
+        if(!Files.exists(sessionPath)) {
+            throw fail(STATE_INVALID, "Cannot access durable anti-exfil state: Coordinator session does not exist");
+        }
         return AntiExfilDurableFiles.locked(sessionPath, this::readValidatedStateUnlocked);
     }
 
