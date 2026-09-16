@@ -209,16 +209,47 @@ class AntiExfilCoordinatorTest {
         byte[] corrupt = Files.readAllBytes(session);
         corrupt[corrupt.length - 1] ^= 1;
         Files.write(session, corrupt);
+        List<String> corruptBefore = treeFingerprint(temporary);
         AntiExfilException checksum = assertThrows(AntiExfilException.class,
                 () -> AntiExfilCoordinator.load(session, journal, keystore));
         assertEquals(AntiExfilException.Code.STATE_INVALID, checksum.getCode());
+        assertEquals(corruptBefore, treeFingerprint(temporary));
 
         Path otherSession = temporary.resolve("other.aexs");
         create(otherSession);
         Keystore other = keystore("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about");
+        List<String> wrongWalletBefore = treeFingerprint(temporary);
         AntiExfilException wrongWallet = assertThrows(AntiExfilException.class,
                 () -> AntiExfilCoordinator.load(otherSession, journal, other));
         assertEquals(AntiExfilException.Code.STATE_INVALID, wrongWallet.getCode());
+        assertEquals(wrongWalletBefore, treeFingerprint(temporary));
+    }
+
+    @Test
+    void missingSessionLoadIsStatePreservingAcrossRepeatedFreshDirectories() throws Exception {
+        for(int i = 0; i < 100; i++) {
+            Path parent = temporary.resolve("missing-" + i);
+            Files.createDirectory(parent);
+            Files.writeString(parent.resolve("sentinel.txt"), "unchanged-" + i, StandardCharsets.US_ASCII);
+            Path missingSession = parent.resolve("session.aexs");
+            Path missingJournal = parent.resolve("wallet.aexj");
+            List<String> before = treeFingerprint(parent);
+
+            AntiExfilException missing = assertThrows(AntiExfilException.class,
+                    () -> AntiExfilCoordinator.load(missingSession, missingJournal, keystore));
+
+            assertEquals(AntiExfilException.Code.STATE_INVALID, missing.getCode());
+            assertEquals("Cannot access durable anti-exfil state: Coordinator session does not exist",
+                    missing.getMessage());
+            assertEquals(before, treeFingerprint(parent));
+            assertFalse(Files.exists(missingSession));
+            assertFalse(Files.exists(Path.of(missingSession + ".lock")));
+            assertFalse(Files.exists(missingJournal));
+            assertFalse(Files.exists(Path.of(missingJournal + ".lock")));
+            try(var children = Files.list(parent)) {
+                assertEquals(List.of("sentinel.txt"), children.map(path -> path.getFileName().toString()).sorted().toList());
+            }
+        }
     }
 
     @Test
@@ -246,6 +277,27 @@ class AntiExfilCoordinatorTest {
         byte[] bytes = new byte[32];
         Arrays.fill(bytes, value);
         return bytes;
+    }
+
+    private static List<String> treeFingerprint(Path root) throws IOException {
+        try(var paths = Files.walk(root)) {
+            return paths.filter(path -> !path.equals(root))
+                    .sorted()
+                    .map(path -> {
+                        Path relative = root.relativize(path);
+                        if(Files.isDirectory(path)) return "D " + relative;
+                        try {
+                            byte[] bytes = Files.readAllBytes(path);
+                            return "F " + relative + " " + bytes.length + " "
+                                    + Utils.bytesToHex(Sha256Hash.hash(bytes));
+                        } catch(IOException e) {
+                            throw new java.io.UncheckedIOException(e);
+                        }
+                    })
+                    .toList();
+        } catch(java.io.UncheckedIOException e) {
+            throw e.getCause();
+        }
     }
 
     private String field(String name) {
