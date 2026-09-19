@@ -92,8 +92,10 @@ public final class AntiExfilCodec {
         validate(previous);
         validate(current);
         if(current.getStage().getCode() != previous.getStage().getCode() + 1) throw fail(WRONG_STAGE, "Stages are not adjacent");
+        if(!Arrays.equals(previous.getSessionId(), current.getSessionId())) {
+            throw fail(SESSION_MISMATCH, "Session identity changed between stages");
+        }
         if(previous.getNetwork() != current.getNetwork()
-                || !Arrays.equals(previous.getSessionId(), current.getSessionId())
                 || !Arrays.equals(previous.getPsbtDigest(), current.getPsbtDigest())) {
             throw fail(TRANSACTION_MISMATCH, "Transcript context changed between stages");
         }

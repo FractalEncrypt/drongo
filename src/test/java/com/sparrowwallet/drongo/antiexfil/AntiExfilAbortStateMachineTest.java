@@ -135,6 +135,26 @@ class AntiExfilAbortStateMachineTest {
     }
 
     @Test
+    void foreignSessionOpeningIsRejectedWithoutPoisoningState() throws IOException {
+        AntiExfilCoordinator coordinator = create("foreign-session.aexs", (byte)0x45);
+        Path session = temporary.resolve("foreign-session.aexs");
+        byte[] sessionBefore = Files.readAllBytes(session);
+        byte[] journalBefore = Files.readAllBytes(journal);
+        AntiExfilMessage openings = AntiExfilCodec.decode(openingsFor(coordinator));
+        byte[] foreignSession = openings.getSessionId();
+        foreignSession[0] ^= 1;
+        byte[] substituted = AntiExfilCodec.encode(new AntiExfilMessage(openings.getNetwork(), openings.getStage(),
+                foreignSession, openings.getPsbtDigest(), openings.getSlots()));
+
+        AntiExfilException rejected = assertThrows(AntiExfilException.class,
+                () -> coordinator.acceptOpenings(substituted));
+        assertEquals(AntiExfilException.Code.SESSION_MISMATCH, rejected.getCode());
+        assertArrayEquals(sessionBefore, Files.readAllBytes(session));
+        assertArrayEquals(journalBefore, Files.readAllBytes(journal));
+        assertTrue(events().isEmpty());
+    }
+
+    @Test
     void transportBoundaryCanRecordSignerRejectionBeforeRevealIdempotently() throws IOException {
         AntiExfilCoordinator coordinator = create("transport-rejection.aexs", (byte)0x49);
         AntiExfilAbortJournal.AbortEvent first = coordinator.recordSignerDataRejection();

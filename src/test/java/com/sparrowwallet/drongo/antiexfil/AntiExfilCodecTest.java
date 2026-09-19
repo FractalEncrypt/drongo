@@ -69,7 +69,7 @@ class AntiExfilCodecTest {
         changedSession[0] ^= 1;
         AntiExfilMessage substituted = new AntiExfilMessage(openings.getNetwork(), openings.getStage(),
                 changedSession, openings.getPsbtDigest(), openings.getSlots());
-        assertEquals(AntiExfilException.Code.TRANSACTION_MISMATCH,
+        assertEquals(AntiExfilException.Code.SESSION_MISMATCH,
                 assertThrows(AntiExfilException.class, () -> AntiExfilCodec.validateTransition(commit, substituted)).getCode());
     }
 
