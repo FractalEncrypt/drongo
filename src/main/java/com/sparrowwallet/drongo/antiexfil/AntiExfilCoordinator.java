@@ -480,8 +480,8 @@ public final class AntiExfilCoordinator {
         if(exception == null) return false;
         return switch(exception.getCode()) {
             case INVALID_MESSAGE, TRANSACTION_MISMATCH, SIGNATURE_SLOT_MISMATCH, COMMITMENT_MISMATCH,
-                    OPENING_MISMATCH, SIGNATURE_INVALID, UNEXPECTED_RETURN_DATA, SESSION_MISMATCH -> true;
-            case WRONG_STAGE, RETRY_CONFLICT, STATE_INVALID -> false;
+                    OPENING_MISMATCH, SIGNATURE_INVALID, UNEXPECTED_RETURN_DATA -> true;
+            case WRONG_STAGE, RETRY_CONFLICT, STATE_INVALID, SESSION_MISMATCH -> false;
         };
     }
 
