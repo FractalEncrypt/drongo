@@ -105,6 +105,7 @@ class AntiExfilCodecTest {
     }
 
     @Test
+    @SuppressWarnings("deprecation")
     void publicMagicMutationCannotChangeCanonicalFraming() throws IOException {
         byte[] canonical = loadMessageVectors().getFirst();
         byte original = AntiExfilCodec.MAGIC[0];
