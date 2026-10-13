@@ -169,12 +169,15 @@ class AntiExfilCodecTest {
             assertNotNull(stream);
             String vector = new String(stream.readAllBytes(), StandardCharsets.UTF_8);
             Matcher matcher = MESSAGE_HEX.matcher(vector);
-            assertTrue(matcher.find());
-            byte[] encoded = Utils.hexToBytes(matcher.group(1));
-            AntiExfilException exception = assertThrows(AntiExfilException.class,
-                    () -> AntiExfilCodec.decode(encoded));
-            assertEquals(AntiExfilException.Code.OPENING_MISMATCH, exception.getCode());
-            assertFalse(matcher.find());
+            int checked = 0;
+            while(matcher.find()) {
+                byte[] encoded = Utils.hexToBytes(matcher.group(1));
+                AntiExfilException exception = assertThrows(AntiExfilException.class,
+                        () -> AntiExfilCodec.decode(encoded));
+                assertEquals(AntiExfilException.Code.OPENING_MISMATCH, exception.getCode());
+                checked++;
+            }
+            assertEquals(7, checked);
         }
     }
 

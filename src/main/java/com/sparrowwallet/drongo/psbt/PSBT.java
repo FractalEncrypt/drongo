@@ -1105,6 +1105,24 @@ public class PSBT {
     }
 
     /**
+     * Verify every finalized input whose UTXO is known, including a partially finalized PSBT.
+     * False means a finalized input lacks the context needed for validation; callers may allow
+     * inspection but must not present that input as verified or permit signing/broadcast egress.
+     */
+    public boolean verifyKnownFinalizedSignatures() throws PSBTSignatureException {
+        boolean complete = true;
+        for(PSBTInput input : getPsbtInputs()) {
+            if(!input.isFinalized()) continue;
+            if(input.getUtxo() == null) {
+                complete = false;
+                continue;
+            }
+            input.verifyFinalizedSignatures();
+        }
+        return complete;
+    }
+
+    /**
      * Verifies that copying the finalized fields of the given PSBT into this one is safe, by checking that the signatures they contain verify against
      * the transaction this PSBT represents, using the signing scripts and keys it already provides.
      *
