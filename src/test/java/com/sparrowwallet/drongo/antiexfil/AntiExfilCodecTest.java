@@ -121,7 +121,7 @@ class AntiExfilCodecTest {
     }
 
     @Test
-    void openingsMustBeUniquePerSignerKey() throws IOException {
+    void openingsMustBeUniqueAcrossTheSlotSet() throws IOException {
         AntiExfilMessage openings = AntiExfilCodec.decode(loadMessageVectors().get(1));
         AntiExfilSlot first = openings.getSlots().get(0);
         AntiExfilSlot second = openings.getSlots().get(1);
@@ -136,9 +136,31 @@ class AntiExfilCodecTest {
         assertDoesNotThrow(() -> AntiExfilCodec.encode(copyMessage(openings,
                 sortedSlots(first, distinctForSameKey, openings.getSlots().get(2)))));
 
+        //Reuse under two sibling keys of the same account xpub is the same key-recovery algebra as same-key reuse.
         AntiExfilSlot repeatedAcrossDifferentKeys = copySlot(second, second.getSignerPublicKey(), first.getOpening());
-        assertDoesNotThrow(() -> AntiExfilCodec.encode(copyMessage(openings,
-                List.of(first, repeatedAcrossDifferentKeys, openings.getSlots().get(2)))));
+        assertFalse(Arrays.equals(first.getSignerPublicKey(), repeatedAcrossDifferentKeys.getSignerPublicKey()));
+        AntiExfilMessage repeatedAcrossKeys = copyMessage(openings,
+                sortedSlots(first, repeatedAcrossDifferentKeys, openings.getSlots().get(2)));
+        assertEquals(AntiExfilException.Code.OPENING_MISMATCH,
+                assertThrows(AntiExfilException.class, () -> AntiExfilCodec.encode(repeatedAcrossKeys)).getCode());
+    }
+
+    @Test
+    void rejectsNegatedOpeningUnderADifferentKey() throws IOException {
+        //R and -R share an x-coordinate, so a comparison on the compressed point alone misses the negated equivalent.
+        AntiExfilMessage openings = AntiExfilCodec.decode(loadMessageVectors().get(1));
+        AntiExfilSlot first = openings.getSlots().get(0);
+        AntiExfilSlot second = openings.getSlots().get(1);
+        byte[] negated = first.getOpening().clone();
+        negated[0] ^= 0x01; //0x02 <-> 0x03
+        assertFalse(Arrays.equals(first.getOpening(), negated));
+        assertFalse(Arrays.equals(first.getSignerPublicKey(), second.getSignerPublicKey()));
+
+        AntiExfilSlot negatedSlot = copySlot(second, second.getSignerPublicKey(), negated);
+        AntiExfilMessage message = copyMessage(openings,
+                sortedSlots(first, negatedSlot, openings.getSlots().get(2)));
+        assertEquals(AntiExfilException.Code.OPENING_MISMATCH,
+                assertThrows(AntiExfilException.class, () -> AntiExfilCodec.encode(message)).getCode());
     }
 
     @Test

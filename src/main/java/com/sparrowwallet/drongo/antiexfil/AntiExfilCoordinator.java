@@ -184,7 +184,10 @@ public final class AntiExfilCoordinator {
                         AntiExfilCodec.decode(state.message1), AntiExfilCodec.decode(state.message2), reveal,
                         signatures, state.rhos);
             } catch(AntiExfilException e) {
-                if(isSignerDataRejection(e)) {
+                // Host randomness has already been disclosed in this phase, so a foreign session ID on
+                // signer-supplied message 4 is a post-reveal abort the signer can choose at will. Unlike
+                // a foreign message 2 before the reveal, it must be journaled.
+                if(isSignerDataRejection(e) || e.getCode() == SESSION_MISMATCH) {
                     AntiExfilMessage commit = AntiExfilCodec.decode(state.message1);
                     journal.append(commit.getSessionId(), commit.getPsbtDigest(), AbortReason.SIGNATURE_REJECTED.name());
                 }

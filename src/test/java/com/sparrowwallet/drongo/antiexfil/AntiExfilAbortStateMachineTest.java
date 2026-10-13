@@ -155,6 +155,43 @@ class AntiExfilAbortStateMachineTest {
     }
 
     @Test
+    void foreignSessionSignaturesAfterRevealAreJournaledOnce() throws IOException {
+        AntiExfilCoordinator coordinator = AntiExfilCoordinator.create(temporary.resolve("foreign-signatures.aexs"),
+                journal, raw, keystore, AntiExfilNetwork.TESTNET4, false, new PinnedVectorRandom());
+        AntiExfilMessage local = AntiExfilCodec.decode(coordinator.getHostCommitMessage());
+        coordinator.acceptOpenings(openingsFor(coordinator));
+        byte[] foreign = withForeignSession(message4);
+
+        AntiExfilException rejected = assertThrows(AntiExfilException.class, () -> coordinator.complete(foreign));
+        assertEquals(AntiExfilException.Code.SESSION_MISMATCH, rejected.getCode());
+        assertFalse(AntiExfilCoordinator.isSignerDataRejection(rejected),
+                "the pre-reveal classification is unchanged; complete() journals because rho was disclosed");
+        assertEquals(AntiExfilCoordinator.Phase.OPENINGS_ACCEPTED, coordinator.getStatus().getPhase());
+        List<AntiExfilAbortJournal.AbortEvent> events = events();
+        assertEquals(1, events.size());
+        assertEquals(AntiExfilCoordinator.AbortReason.SIGNATURE_REJECTED.name(), events.getFirst().getReason());
+        assertArrayEquals(local.getSessionId(), events.getFirst().getSessionId(),
+                "the event is keyed to the local session, never to the signer-chosen session ID");
+        assertArrayEquals(local.getPsbtDigest(), events.getFirst().getPsbtDigest());
+        byte[] afterFirst = Files.readAllBytes(journal);
+
+        AntiExfilException repeated = assertThrows(AntiExfilException.class, () -> coordinator.complete(foreign));
+        assertEquals(AntiExfilException.Code.SESSION_MISMATCH, repeated.getCode());
+        assertArrayEquals(afterFirst, Files.readAllBytes(journal));
+
+        AntiExfilException fresh = assertThrows(AntiExfilException.class,
+                () -> create("fresh-after-foreign-signatures.aexs", (byte)0x47));
+        assertEquals(AntiExfilException.Code.RETRY_CONFLICT, fresh.getCode());
+        assertFalse(Files.exists(temporary.resolve("fresh-after-foreign-signatures.aexs")));
+        assertDoesNotThrow(() -> create("acknowledged-after-foreign-signatures.aexs", (byte)0x48, true));
+
+        AntiExfilCoordinator.Completion completion = coordinator.complete(message4);
+        assertFalse(completion.isBroadcast());
+        assertEquals(AntiExfilCoordinator.Phase.COMPLETE, coordinator.getStatus().getPhase());
+        assertEquals(1, events().size());
+    }
+
+    @Test
     void transportBoundaryCanRecordSignerRejectionBeforeRevealIdempotently() throws IOException {
         AntiExfilCoordinator coordinator = create("transport-rejection.aexs", (byte)0x49);
         AntiExfilAbortJournal.AbortEvent first = coordinator.recordSignerDataRejection();
@@ -325,6 +362,14 @@ class AntiExfilAbortStateMachineTest {
         }
         return AntiExfilCodec.encode(new AntiExfilMessage(commit.getNetwork(), AntiExfilStage.SIGNER_OPENINGS,
                 commit.getSessionId(), commit.getPsbtDigest(), slots));
+    }
+
+    private static byte[] withForeignSession(byte[] encoded) {
+        AntiExfilMessage message = AntiExfilCodec.decode(encoded);
+        byte[] foreignSession = message.getSessionId();
+        foreignSession[0] ^= 1;
+        return AntiExfilCodec.encode(new AntiExfilMessage(message.getNetwork(), message.getStage(),
+                foreignSession, message.getPsbtDigest(), message.getSlots()));
     }
 
     private byte[] invalidSignatures() {

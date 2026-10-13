@@ -1025,6 +1025,14 @@ public class PSBT {
         verifyCombinedUtxos(verificationCopy);
         verificationCopy.verifySignatures();
         verifyCombinedSigHashes(verificationCopy);
+        for(int i = 0; i < verificationCopy.getPsbtInputs().size(); i++) {
+            PSBTInput verificationInput = verificationCopy.getPsbtInputs().get(i);
+            if(verificationInput.isFinalized()) {
+                // Partial-signature verification skips final fields. Verify them against the combined UTXO,
+                // and compare their sighash flags against the original input's policy before mutation.
+                verifyFinalizedSigHashes(getPsbtInputs().get(i), verificationInput.verifyFinalizedSignatures());
+            }
+        }
 
         return verificationCopy;
     }

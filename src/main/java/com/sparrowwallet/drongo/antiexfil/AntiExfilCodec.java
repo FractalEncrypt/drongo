@@ -6,10 +6,8 @@ import java.math.BigInteger;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Map;
 import java.util.Set;
 
 import static com.sparrowwallet.drongo.antiexfil.AntiExfilException.Code.*;
@@ -127,7 +125,7 @@ public final class AntiExfilCodec {
         }
         Set<Bytes> commitments = new HashSet<>();
         Set<Bytes> reveals = new HashSet<>();
-        Map<Bytes, Set<Bytes>> openingsBySigner = new HashMap<>();
+        Set<Bytes> openingXCoordinates = new HashSet<>();
         long previousInput = -1;
         byte[] previousKey = null;
         int perInput = 0;
@@ -138,10 +136,11 @@ public final class AntiExfilCodec {
             if(!commitments.add(new Bytes(slot.getCommitment()))) throw fail(COMMITMENT_MISMATCH, "Duplicate host commitment");
             if(slot.getHostRandomness() != null && !reveals.add(new Bytes(slot.getHostRandomness()))) throw fail(COMMITMENT_MISMATCH, "Duplicate host reveal");
             if(slot.getOpening() != null) {
-                Set<Bytes> signerOpenings = openingsBySigner.computeIfAbsent(
-                        new Bytes(slot.getSignerPublicKey()), ignored -> new HashSet<>());
-                if(!signerOpenings.add(new Bytes(slot.getOpening()))) {
-                    throw fail(OPENING_MISMATCH, "Signer openings must be unique per signer public key");
+                // Global, not per signer key: every slot key is a non-hardened sibling under one account xpub, so one
+                // opening reused under two sibling keys leaks the account key like same-key reuse. Keying on the
+                // x-coordinate also rejects the negated equivalent R and -R, which share it.
+                if(!openingXCoordinates.add(new Bytes(Arrays.copyOfRange(slot.getOpening(), 1, 33)))) {
+                    throw fail(OPENING_MISMATCH, "Signer openings must be unique across the slot set");
                 }
             }
             perInput = slot.getInputIndex() == previousInput ? perInput + 1 : 1;

@@ -87,9 +87,13 @@ class AntiExfilCoordinatorTest {
         coordinator.acceptOpenings(message2);
         AntiExfilMessage original = AntiExfilCodec.decode(message2);
         List<AntiExfilSlot> changed = new ArrayList<>(original.getSlots());
-        AntiExfilSlot first = changed.getFirst();
+        AntiExfilSlot first = changed.get(0);
+        AntiExfilSlot second = changed.get(1);
+        //Swap two openings: the retry changes accepted openings while every opening stays unique.
         changed.set(0, new AntiExfilSlot(first.getInputIndex(), first.getSighashType(), first.getSignerPublicKey(),
-                first.getMessageHash(), first.getCommitment(), changed.get(1).getOpening(), null, null));
+                first.getMessageHash(), first.getCommitment(), second.getOpening(), null, null));
+        changed.set(1, new AntiExfilSlot(second.getInputIndex(), second.getSighashType(), second.getSignerPublicKey(),
+                second.getMessageHash(), second.getCommitment(), first.getOpening(), null, null));
         byte[] changedMessage = AntiExfilCodec.encode(new AntiExfilMessage(original.getNetwork(), original.getStage(),
                 original.getSessionId(), original.getPsbtDigest(), changed));
         AntiExfilException exception = assertThrows(AntiExfilException.class, () -> coordinator.acceptOpenings(changedMessage));

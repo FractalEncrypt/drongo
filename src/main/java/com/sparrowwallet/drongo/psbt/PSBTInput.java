@@ -638,6 +638,11 @@ public class PSBTInput {
         if(psbtInput.tapInternalKey != null) {
             tapInternalKey = psbtInput.tapInternalKey;
         }
+
+        // An individual input may be finalized even while the PSBT is not. Preserve its final fields.
+        if(psbtInput.finalScriptSig != null) finalScriptSig = psbtInput.finalScriptSig;
+        if(psbtInput.finalScriptWitness != null) finalScriptWitness = psbtInput.finalScriptWitness;
+        if(isFinalized()) clearNonFinalFields();
     }
 
     public Transaction getNonWitnessUtxo() {
