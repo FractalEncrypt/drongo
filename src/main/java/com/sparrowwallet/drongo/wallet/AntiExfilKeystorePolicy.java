@@ -6,8 +6,8 @@ package com.sparrowwallet.drongo.wallet;
  */
 public enum AntiExfilKeystorePolicy {
     UNSUPPORTED("Unsupported"),
-    OPTIONAL("Available (optional)"),
-    REQUIRED("Legacy Required — now optional");
+    OPTIONAL("Enabled"),
+    REQUIRED("Enabled (legacy)");
 
     private final String displayName;
 
