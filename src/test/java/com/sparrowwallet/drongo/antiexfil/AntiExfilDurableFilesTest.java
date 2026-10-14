@@ -170,16 +170,6 @@ class AntiExfilDurableFilesTest {
         });
     }
 
-    @Test
-    void coordinatorStateLengthChecksExactAggregateAndPerFieldBounds() throws Exception {
-        assertEquals(207, AntiExfilCoordinator.checkedStateFileLength(
-                1, 1, 1, 1, 1, 1, 32, 1, 207));
-        assertThrows(IOException.class, () -> AntiExfilCoordinator.checkedStateFileLength(
-                1, 1, 1, 1, 1, 1, 32, 1, 206));
-        assertThrows(IOException.class, () -> AntiExfilCoordinator.checkedStateFileLength(
-                1, 1, -1, -1, -1, (16 * 1024 * 1024) + 1, 32, 1, Integer.MAX_VALUE));
-    }
-
     private static boolean isWindows() {
         return System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT).contains("windows");
     }

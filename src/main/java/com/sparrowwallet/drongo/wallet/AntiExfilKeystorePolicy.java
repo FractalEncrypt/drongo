@@ -2,12 +2,12 @@ package com.sparrowwallet.drongo.wallet;
 
 /**
  * Declares whether a keystore can use the interactive anti-exfil signing
- * protocol and whether that protocol is mandatory.
+ * protocol. REQUIRED is retained solely for legacy profile compatibility; it has no mandatory signing semantics.
  */
 public enum AntiExfilKeystorePolicy {
     UNSUPPORTED("Unsupported"),
-    OPTIONAL("Optional"),
-    REQUIRED("Required");
+    OPTIONAL("Available (optional)"),
+    REQUIRED("Legacy Required — now optional");
 
     private final String displayName;
 
@@ -20,7 +20,7 @@ public enum AntiExfilKeystorePolicy {
     }
 
     public boolean isRequired() {
-        return this == REQUIRED;
+        return false; // Required provenance is retired; ordinal retained for old profiles.
     }
 
     @Override

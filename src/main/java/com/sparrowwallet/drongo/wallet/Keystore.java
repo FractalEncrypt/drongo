@@ -128,7 +128,7 @@ public class Keystore extends Persistable {
     }
 
     public boolean isAntiExfilRequired() {
-        return antiExfilPolicy == AntiExfilKeystorePolicy.REQUIRED;
+        return false; // Legacy Required is capability metadata, never an enforcement rule.
     }
 
     public void setAntiExfilRequired(boolean antiExfilRequired) {

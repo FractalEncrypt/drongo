@@ -18,7 +18,7 @@ import java.util.List;
 
 public final class AntiExfilAbortJournal {
     private static final byte[] MAGIC = {'A', 'E', 'X', 'J'};
-    private static final int VERSION = 1;
+    private static final int VERSION = 2;
     private static final int MAX_FILE_BYTES = 4 * 1024 * 1024;
     private static final int MAX_EVENTS = 10_000;
     private static final int MAX_REASON_BYTES = 512;
@@ -92,7 +92,8 @@ public final class AntiExfilAbortJournal {
     private static Journal decode(byte[] body) throws IOException {
         try(DataInputStream input = new DataInputStream(new ByteArrayInputStream(body))) {
             byte[] magic = input.readNBytes(4);
-            if(!Arrays.equals(magic, MAGIC) || input.readUnsignedByte() != VERSION) throw new IOException("Unknown abort-journal format");
+            int version = input.readUnsignedByte();
+            if(!Arrays.equals(magic, MAGIC) || version < 1 || version > VERSION) throw new IOException("Unknown abort-journal format");
             byte[] identity = input.readNBytes(32);
             int count = input.readInt();
             if(identity.length != 32 || count < 0 || count > MAX_EVENTS) throw new IOException("Invalid abort-journal header");
@@ -139,11 +140,59 @@ public final class AntiExfilAbortJournal {
         private Journal journal;
 
         private LockedJournal(Journal loaded) {
-            List<AbortEvent> unique = new ArrayList<>();
-            for(AbortEvent candidate : loaded.events) {
-                if(findBySession(unique, candidate.sessionId) == null) unique.add(candidate);
+            this.journal = loaded; // Preserve every historical event, including legacy aborts.
+        }
+
+        // Legacy post-reveal events are permanently unresolved. PRE_REVEAL_REJECTED
+        // conveys no reveal and cannot be used to resolve a later pending marker.
+        private List<AbortEvent> unresolved() {
+            List<AbortEvent> pending = new ArrayList<>();
+            for(AbortEvent event : journal.events) {
+                if(event.reason.equals("PRE_REVEAL_REJECTED")) continue;
+                if(event.reason.equals("VERIFIED_COMPLETE")) {
+                    AbortEvent prior = findBySession(pending, event.sessionId);
+                    if(prior == null || !prior.reason.equals("PENDING_REVEAL")
+                            || !Arrays.equals(prior.psbtDigest, event.psbtDigest)) {
+                        throw new AntiExfilException(AntiExfilException.Code.STATE_INVALID, "Invalid lifecycle resolution");
+                    }
+                    pending.remove(prior);
+                } else if(findBySession(pending, event.sessionId) == null) {
+                    pending.add(event);
+                }
             }
-            this.journal = new Journal(loaded.walletIdentity, unique);
+            return pending;
+        }
+
+        void requireFreshAttempt() {
+            if(!unresolved().isEmpty()) throw new AntiExfilException(AntiExfilException.Code.RETRY_CONFLICT,
+                    "This account key has an unresolved possible reveal or legacy abort. A fresh Protected QR challenge is refused; only the surviving in-memory exchange can retry exactly. Show QR remains ordinary signing.");
+        }
+
+        void requirePending(byte[] sessionId, byte[] digest) {
+            List<AbortEvent> pending = unresolved();
+            if(pending.size() != 1 || !pending.getFirst().reason.equals("PENDING_REVEAL")
+                    || !Arrays.equals(pending.getFirst().sessionId, sessionId)
+                    || !Arrays.equals(pending.getFirst().psbtDigest, digest)) {
+                throw new AntiExfilException(AntiExfilException.Code.RETRY_CONFLICT, "No matching durable pending reveal");
+            }
+        }
+
+        void beginReveal(byte[] sessionId, byte[] digest) throws IOException {
+            requireFreshAttempt();
+            // Session identifiers must never be reused, even following a resolved event.
+            if(findBySession(journal.events, sessionId) != null) throw new IOException("Session identity was already used");
+            append(sessionId, digest, "PENDING_REVEAL");
+        }
+
+        void resolveReveal(byte[] sessionId, byte[] digest) throws IOException {
+            requirePending(sessionId, digest);
+            append(sessionId, digest, "VERIFIED_COMPLETE");
+        }
+
+        AbortEvent noteUnresolved(byte[] sessionId, byte[] digest, String reason) throws IOException {
+            requirePending(sessionId, digest);
+            // Keep the pending marker; an explicit interruption can never clear it.
+            return append(sessionId, digest, reason);
         }
 
         List<AbortEvent> getEvents() {
@@ -156,8 +205,12 @@ public final class AntiExfilAbortJournal {
 
         AbortEvent append(byte[] sessionId, byte[] psbtDigest, String reason) throws IOException {
             String normalizedReason = validateEvent(sessionId, psbtDigest, reason);
-            AbortEvent existing = findBySession(journal.events, sessionId);
-            if(existing != null) return existing;
+            for(AbortEvent existing : journal.events) {
+                if(Arrays.equals(existing.sessionId, sessionId) && existing.reason.equals(normalizedReason)) {
+                    if(!Arrays.equals(existing.psbtDigest, psbtDigest)) throw new IOException("Lifecycle context changed");
+                    return existing;
+                }
+            }
             if(journal.events.size() >= MAX_EVENTS) throw new IOException("Abort journal is full");
             AbortEvent event = new AbortEvent(sessionId, psbtDigest, Instant.now().getEpochSecond(), normalizedReason);
             List<AbortEvent> updated = new ArrayList<>(journal.events);

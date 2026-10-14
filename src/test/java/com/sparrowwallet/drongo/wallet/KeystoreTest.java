@@ -22,7 +22,7 @@ public class KeystoreTest {
         keystore.setAntiExfilProfile(AntiExfilProfile.AEXT_V1);
 
         Keystore copy = keystore.copy();
-        Assertions.assertTrue(copy.isAntiExfilRequired());
+        Assertions.assertFalse(copy.isAntiExfilRequired());
         Assertions.assertTrue(copy.supportsAntiExfil());
         Assertions.assertEquals(AntiExfilKeystorePolicy.REQUIRED, copy.getAntiExfilPolicy());
         Assertions.assertEquals(WalletModel.SPECTER_DIY, copy.getWalletModel());

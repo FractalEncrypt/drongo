@@ -64,206 +64,183 @@ class AntiExfilCoordinatorTest {
     }
 
     @Test
-    void persistsFrozenSessionBeforeReturningExactReveal() {
-        AntiExfilCoordinator coordinator = create(session);
+    void retainsFrozenCommitmentAndExactRevealOnlyInRam() throws Exception {
+        var coordinator = create(session);
         assertArrayEquals(message1, coordinator.getHostCommitMessage());
+        byte[] original = coordinator.getFrozenPsbt(); original[0] ^= 1;
         assertArrayEquals(raw, coordinator.getFrozenPsbt());
         byte[] reveal = coordinator.acceptOpenings(message2);
+        assertArrayEquals(reveal, coordinator.acceptOpenings(message2));
+        assertArrayEquals(reveal, coordinator.getHostRevealMessage());
+        assertFalse(Files.exists(session));
+        assertFalse(Files.exists(session.resolveSibling("session.aexs.lock")));
+        assertEquals("PENDING_REVEAL", events().getFirst().getReason());
+        assertNoRevealOnDisk(reveal);
+    }
 
-        AntiExfilCoordinator reloaded = AntiExfilCoordinator.load(session, journal, keystore);
-        assertEquals(AntiExfilCoordinator.Phase.OPENINGS_ACCEPTED, reloaded.getStatus().getPhase());
-        assertArrayEquals(reveal, reloaded.getHostRevealMessage());
-        assertArrayEquals(reveal, reloaded.acceptOpenings(message2));
-        AntiExfilMessage decoded = AntiExfilCodec.decode(reveal);
-        assertEquals(AntiExfilStage.HOST_REVEAL, decoded.getStage());
-        for(int i = 0; i < decoded.getSlots().size(); i++) {
-            assertArrayEquals(repeat((byte)(0x80 + i)), decoded.getSlots().get(i).getHostRandomness());
+    @Test
+    void completionResolvesHistoryAndRetainsOnlyExactSignatureStatus() throws Exception {
+        var coordinator = create(session);
+        byte[] reveal = coordinator.acceptOpenings(message2);
+        var completion = coordinator.complete(message4);
+        assertFalse(completion.isBroadcast());
+        assertEquals(5, completion.getVerifiedSignatures().size());
+        assertEquals(Set.of("PENDING_REVEAL", "VERIFIED_COMPLETE"), events().stream().map(AntiExfilAbortJournal.AbortEvent::getReason).collect(java.util.stream.Collectors.toSet()));
+        assertThrows(AntiExfilException.class, coordinator::getHostRevealMessage);
+        assertThrows(AntiExfilException.class, coordinator::getFrozenPsbt);
+        assertSame(completion, coordinator.getCompletedResult());
+        assertNoRevealOnDisk(reveal);
+        assertDoesNotThrow(() -> AntiExfilCoordinator.create(null, journal, raw, keystore, AntiExfilNetwork.TESTNET4));
+    }
+
+    @Test
+    void restartCannotRestoreStateOrOverridePendingWithAcknowledgement() {
+        var coordinator = create(session);
+        coordinator.acceptOpenings(message2);
+        coordinator.close();
+        assertEquals(AntiExfilCoordinator.Phase.CLOSED, coordinator.getStatus().getPhase());
+        assertThrows(AntiExfilException.class, () -> AntiExfilCoordinator.load(session,journal,keystore));
+        assertThrows(AntiExfilException.class, () -> AntiExfilCoordinator.create(null,journal,raw,keystore,AntiExfilNetwork.TESTNET4,true));
+        assertThrows(AntiExfilException.class, coordinator::getHostRevealMessage);
+        assertEquals("PENDING_REVEAL", events().getFirst().getReason());
+    }
+
+    @Test
+    void cancellingBeforeRevealAllowsFreshAttempt() {
+        var coordinator = create(session);
+        coordinator.close();
+        assertTrue(events().isEmpty());
+        assertDoesNotThrow(() -> AntiExfilCoordinator.create(null,journal,raw,keystore,AntiExfilNetwork.TESTNET4));
+    }
+
+    @Test
+    void explicitAbandonPreservesPendingAndDropsOwnedSecrets() {
+        var coordinator = create(session);
+        coordinator.acceptOpenings(message2);
+        coordinator.recordPostRevealAbort(AntiExfilCoordinator.AbortReason.USER_ABANDONED);
+        assertEquals(List.of("PENDING_REVEAL", "USER_ABANDONED"), events().stream().map(AntiExfilAbortJournal.AbortEvent::getReason).toList());
+        assertThrows(AntiExfilException.class, coordinator::getHostRevealMessage);
+        assertThrows(AntiExfilException.class, () -> AntiExfilCoordinator.create(null,journal,raw,keystore,AntiExfilNetwork.TESTNET4,true));
+    }
+
+    @Test
+    void duplicateWalletCannotGetFreshChallengeAfterPendingReveal() {
+        var coordinator=create(session); coordinator.acceptOpenings(message2);
+        Keystore duplicate=keystore.copy(); duplicate.setLabel("Another wallet / same account");
+        assertThrows(AntiExfilException.class, () -> AntiExfilCoordinator.create(null,journal,raw,duplicate,AntiExfilNetwork.TESTNET4,true));
+    }
+
+    @Test
+    void precreatedConcurrentSessionCannotRevealAfterFirstPendingMarker() {
+        var first=create(session);
+        var second=AntiExfilCoordinator.create(null,journal,raw,keystore,AntiExfilNetwork.TESTNET4);
+        byte[] secondOpenings=openingsFor(second);
+        first.acceptOpenings(message2);
+        assertThrows(AntiExfilException.class, () -> second.acceptOpenings(secondOpenings));
+        assertEquals(AntiExfilCoordinator.Phase.COMMITMENTS_CREATED,second.getStatus().getPhase());
+        assertEquals(1,events().size());
+    }
+
+    @Test
+    void concurrentRevealReservationsHaveExactlyOneWinner() throws Exception {
+        var first=create(session);
+        var second=AntiExfilCoordinator.create(null,journal,raw,keystore,AntiExfilNetwork.TESTNET4);
+        byte[] secondOpenings=openingsFor(second);
+        java.util.concurrent.CountDownLatch start=new java.util.concurrent.CountDownLatch(1);
+        try(var executor=java.util.concurrent.Executors.newFixedThreadPool(2)) {
+            var a=executor.submit(() -> {start.await(); try {first.acceptOpenings(message2);return true;}catch(AntiExfilException e){return false;}});
+            var b=executor.submit(() -> {start.await(); try {second.acceptOpenings(secondOpenings);return true;}catch(AntiExfilException e){return false;}});
+            start.countDown(); assertNotEquals(a.get(),b.get());
         }
+        assertEquals(1,events().size());
     }
 
     @Test
-    void rejectsChangedOpeningAfterDurableAcceptance() {
-        AntiExfilCoordinator coordinator = create(session);
-        coordinator.acceptOpenings(message2);
-        AntiExfilMessage original = AntiExfilCodec.decode(message2);
-        List<AntiExfilSlot> changed = new ArrayList<>(original.getSlots());
-        AntiExfilSlot first = changed.get(0);
-        AntiExfilSlot second = changed.get(1);
-        //Swap two openings: the retry changes accepted openings while every opening stays unique.
-        changed.set(0, new AntiExfilSlot(first.getInputIndex(), first.getSighashType(), first.getSignerPublicKey(),
-                first.getMessageHash(), first.getCommitment(), second.getOpening(), null, null));
-        changed.set(1, new AntiExfilSlot(second.getInputIndex(), second.getSighashType(), second.getSignerPublicKey(),
-                second.getMessageHash(), second.getCommitment(), first.getOpening(), null, null));
-        byte[] changedMessage = AntiExfilCodec.encode(new AntiExfilMessage(original.getNetwork(), original.getStage(),
-                original.getSessionId(), original.getPsbtDigest(), changed));
-        AntiExfilException exception = assertThrows(AntiExfilException.class, () -> coordinator.acceptOpenings(changedMessage));
-        assertEquals(AntiExfilException.Code.RETRY_CONFLICT, exception.getCode());
+    void changedOpeningsCannotChangeRevealOrHistory() {
+        var coordinator=create(session); byte[] reveal=coordinator.acceptOpenings(message2);
+        assertThrows(AntiExfilException.class,()->coordinator.acceptOpenings(foreign(message2)));
+        assertArrayEquals(reveal,coordinator.getHostRevealMessage()); assertEquals(1,events().size());
     }
 
     @Test
-    void reconstructsOnlyVerifiedSignaturesAndNeverBroadcasts() {
-        AntiExfilCoordinator coordinator = create(session);
-        coordinator.acceptOpenings(message2);
-        AntiExfilCoordinator.Completion completed = coordinator.complete(message4);
-        assertFalse(completed.isBroadcast());
-        assertEquals(field("signed_psbt_sha256"), Utils.bytesToHex(Sha256Hash.hash(completed.getSignedPsbt())));
-
-        AntiExfilCoordinator reloaded = AntiExfilCoordinator.load(session, journal, keystore);
-        assertEquals(AntiExfilCoordinator.Phase.COMPLETE, reloaded.getStatus().getPhase());
-        assertFalse(reloaded.getStatus().isBroadcast());
-        assertArrayEquals(completed.getSignedPsbt(), reloaded.complete(message4).getSignedPsbt());
-        assertArrayEquals(completed.getSignedPsbt(), reloaded.getCompletedResult().getSignedPsbt());
-
-        byte[] changed = message4.clone();
-        changed[changed.length - 1] ^= 1;
-        AntiExfilException exception = assertThrows(AntiExfilException.class, () -> reloaded.complete(changed));
-        assertEquals(AntiExfilException.Code.RETRY_CONFLICT, exception.getCode());
+    void foreignSignatureSessionCannotCompleteOrClearPending() {
+        var coordinator=create(session); coordinator.acceptOpenings(message2);
+        assertThrows(AntiExfilException.class,()->coordinator.complete(foreign(message4)));
+        assertEquals("PENDING_REVEAL",events().getFirst().getReason());
+        assertThrows(AntiExfilException.class,coordinator::getCompletedResult);
+        assertThrows(AntiExfilException.class,()->AntiExfilCoordinator.create(null,journal,raw,keystore,AntiExfilNetwork.TESTNET4,true));
     }
 
     @Test
-    void derivesIdenticalImmutableSignatureProofsAtCompletionAndAfterReload() {
-        assertEquals(0, VerifiedAntiExfilSignature.class.getConstructors().length);
-        AntiExfilCoordinator coordinator = create(session);
-        coordinator.acceptOpenings(message2);
-        AntiExfilCoordinator.Completion completed = coordinator.complete(message4);
-
-        Set<VerifiedAntiExfilSignature> fresh = completed.getVerifiedSignatures();
-        assertEquals(5, fresh.size());
-        assertThrows(UnsupportedOperationException.class, fresh::clear);
-
-        AntiExfilMessage commit = AntiExfilCodec.decode(message1);
-        AntiExfilMessage signatures = AntiExfilCodec.decode(message4);
-        VerifiedAntiExfilSignature first = fresh.stream()
-                .filter(proof -> proof.getInputIndex() == 0)
-                .findFirst().orElseThrow();
-        assertArrayEquals(commit.getSessionId(), first.getSessionId());
-        assertArrayEquals(Sha256Hash.hash(raw), first.getOriginalPsbtDigest());
-        assertArrayEquals(AntiExfilCoordinator.getWalletKeyIdentity(keystore), first.getWalletKeyIdentity());
-        assertArrayEquals(signatures.getSlots().getFirst().getSignerPublicKey(), first.getSignerPublicKey());
-        assertArrayEquals(signatures.getSlots().getFirst().getMessageHash(), first.getMessageHash());
-        assertArrayEquals(signatures.getSlots().getFirst().getSignature(), first.getCompactSignature());
-        assertEquals(AntiExfilCodec.SIGHASH_ALL, first.getSighashType());
-        assertEquals(36, first.getOutpoint().length);
-
-        byte[] mutated = first.getCompactSignature();
-        mutated[0] ^= 1;
-        assertArrayEquals(signatures.getSlots().getFirst().getSignature(), first.getCompactSignature());
-
-        AntiExfilCoordinator reloaded = AntiExfilCoordinator.load(session, journal, keystore);
-        assertEquals(fresh, reloaded.getCompletedResult().getVerifiedSignatures());
-        assertEquals(fresh, reloaded.complete(message4).getVerifiedSignatures());
+    void invalidSignatureCannotProduceCompletionOrResolution() {
+        var coordinator=create(session); coordinator.acceptOpenings(message2);
+        AntiExfilMessage valid=AntiExfilCodec.decode(message4);
+        var slots=new ArrayList<>(valid.getSlots());var first=slots.getFirst();
+        byte[] invalid=new byte[64];invalid[31]=1;invalid[63]=1;
+        slots.set(0,new AntiExfilSlot(first.getInputIndex(),first.getSighashType(),first.getSignerPublicKey(),first.getMessageHash(),first.getCommitment(),first.getOpening(),null,invalid));
+        byte[] bad=AntiExfilCodec.encode(new AntiExfilMessage(valid.getNetwork(),valid.getStage(),valid.getSessionId(),valid.getPsbtDigest(),slots));
+        assertThrows(AntiExfilException.class,()->coordinator.complete(bad));
+        assertThrows(AntiExfilException.class,coordinator::getCompletedResult);assertEquals(1,events().size());
     }
 
     @Test
-    void admitsOnlySupportedNewSessionsButPreservesCompletedEvidenceAfterPolicyChange() {
-        Keystore unsupported = keystore.copy();
-        unsupported.setAntiExfilPolicy(AntiExfilKeystorePolicy.UNSUPPORTED);
-        Path unsupportedSession = temporary.resolve("unsupported.aexs");
-        AntiExfilException rejected = assertThrows(AntiExfilException.class,
-                () -> AntiExfilCoordinator.create(unsupportedSession, temporary.resolve("unsupported.aexj"),
-                        raw, unsupported, AntiExfilNetwork.TESTNET4));
-        assertEquals(AntiExfilException.Code.STATE_INVALID, rejected.getCode());
-        assertFalse(Files.exists(unsupportedSession));
+    void corruptJournalPreventsReveal() throws Exception {
+        var coordinator=create(session);Files.write(journal,new byte[]{1,2,3});
+        assertThrows(AntiExfilException.class,()->coordinator.acceptOpenings(message2));
+        assertThrows(AntiExfilException.class,coordinator::getHostRevealMessage);
+    }
 
-        Keystore required = keystore.copy();
-        required.setAntiExfilPolicy(AntiExfilKeystorePolicy.REQUIRED);
-        assertDoesNotThrow(() -> AntiExfilCoordinator.create(temporary.resolve("required.aexs"),
-                temporary.resolve("required.aexj"), raw, required, AntiExfilNetwork.TESTNET4));
+    @Test
+    void unavailableResolutionNeverReleasesVerifiedResult() throws Exception {
+        var coordinator=create(session);coordinator.acceptOpenings(message2);Files.write(journal,new byte[]{1,2,3});
+        assertThrows(AntiExfilException.class,()->coordinator.complete(message4));
+        assertThrows(AntiExfilException.class,coordinator::getCompletedResult);
+    }
 
-        AntiExfilCoordinator completed = create(session);
-        completed.acceptOpenings(message2);
-        Set<VerifiedAntiExfilSignature> evidence = completed.complete(message4).getVerifiedSignatures();
+    @Test
+    void legacyFilesAreNeverReadOrMutatedDuringRestore() throws Exception {
+        Files.write(session,new byte[]{'A','E','X','S',2,1,99});byte[] original=Files.readAllBytes(session);
+        assertThrows(AntiExfilException.class,()->AntiExfilCoordinator.load(session,journal,keystore));
+        assertArrayEquals(original,Files.readAllBytes(session));assertFalse(Files.exists(journal));
+    }
+
+    @Test
+    void legacyAbortHistoryIsPreservedAndNeverAcknowledgedAway() throws Exception {
+        var log=new AntiExfilAbortJournal(journal,AntiExfilCoordinator.getWalletKeyIdentity(keystore));
+        log.append(repeat((byte)1),repeat((byte)2),"USER_ABANDONED");
+        // Construct a valid historical version-one journal without secret contents.
+        byte[] body=AntiExfilDurableFiles.read(journal,4*1024*1024);body[4]=1;
+        AntiExfilDurableFiles.write(journal,body,false,4*1024*1024);byte[] original=Files.readAllBytes(journal);
+        assertThrows(AntiExfilException.class,()->AntiExfilCoordinator.create(null,journal,raw,keystore,AntiExfilNetwork.TESTNET4,true));
+        assertArrayEquals(original,Files.readAllBytes(journal));assertEquals("USER_ABANDONED",events().getFirst().getReason());
+    }
+
+    @Test
+    void unsupportedKeystoreIsRefusedAndLegacyRequiredIsOptional() {
         keystore.setAntiExfilPolicy(AntiExfilKeystorePolicy.UNSUPPORTED);
-        assertEquals(evidence, AntiExfilCoordinator.load(session, journal, keystore)
-                .getCompletedResult().getVerifiedSignatures());
+        assertThrows(AntiExfilException.class,()->create(session));
+        keystore.setAntiExfilPolicy(AntiExfilKeystorePolicy.REQUIRED);
+        assertTrue(keystore.supportsAntiExfil());assertFalse(keystore.isAntiExfilRequired());
+        assertDoesNotThrow(()->create(session));
     }
 
-    @Test
-    void recordsPostRevealAbortsAgainstWalletIdentityAndRequiresAcknowledgement() {
-        AntiExfilCoordinator coordinator = create(session);
-        assertThrows(AntiExfilException.class, () -> coordinator.recordPostRevealAbort(AntiExfilCoordinator.AbortReason.USER_ABANDONED));
-        coordinator.acceptOpenings(message2);
-        AntiExfilAbortJournal.AbortEvent first = coordinator.recordPostRevealAbort(
-                AntiExfilCoordinator.AbortReason.SIGNER_CANCELLED);
-        AntiExfilAbortJournal.AbortEvent duplicate = coordinator.recordPostRevealAbort(
-                AntiExfilCoordinator.AbortReason.TRANSPORT_FAILED);
-        assertEquals(first.getRecordedAtEpochSecond(), duplicate.getRecordedAtEpochSecond());
-        assertEquals(AntiExfilCoordinator.AbortReason.SIGNER_CANCELLED.name(), duplicate.getReason());
-
-        AntiExfilCoordinator reloaded = AntiExfilCoordinator.load(session, journal, keystore);
-        assertEquals(1, reloaded.getStatus().getPostRevealAbortCount());
-        List<AntiExfilAbortJournal.AbortEvent> events = new AntiExfilAbortJournal(journal,
-                walletIdentityForTest(keystore)).getEvents();
-        assertEquals(1, events.size());
-        assertArrayEquals(AntiExfilCodec.decode(message1).getSessionId(), events.getFirst().getSessionId());
-
-        Path fresh = temporary.resolve("fresh.aexs");
-        AntiExfilException blocked = assertThrows(AntiExfilException.class, () -> AntiExfilCoordinator.create(
-                fresh, journal, raw, keystore, AntiExfilNetwork.TESTNET4, false, new VectorRandom()));
-        assertEquals(AntiExfilException.Code.RETRY_CONFLICT, blocked.getCode());
-        assertFalse(Files.exists(fresh));
-        AntiExfilCoordinator acknowledged = AntiExfilCoordinator.create(
-                fresh, journal, raw, keystore, AntiExfilNetwork.TESTNET4, true, new VectorRandom());
-        assertEquals(1, acknowledged.getStatus().getPostRevealAbortCount());
-    }
-
-    @Test
-    void failsClosedOnCorruptStateAndWrongWallet() throws Exception {
-        create(session);
-        byte[] corrupt = Files.readAllBytes(session);
-        corrupt[corrupt.length - 1] ^= 1;
-        Files.write(session, corrupt);
-        List<String> corruptBefore = treeFingerprint(temporary);
-        AntiExfilException checksum = assertThrows(AntiExfilException.class,
-                () -> AntiExfilCoordinator.load(session, journal, keystore));
-        assertEquals(AntiExfilException.Code.STATE_INVALID, checksum.getCode());
-        assertEquals(corruptBefore, treeFingerprint(temporary));
-
-        Path otherSession = temporary.resolve("other.aexs");
-        create(otherSession);
-        Keystore other = keystore("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about");
-        List<String> wrongWalletBefore = treeFingerprint(temporary);
-        AntiExfilException wrongWallet = assertThrows(AntiExfilException.class,
-                () -> AntiExfilCoordinator.load(otherSession, journal, other));
-        assertEquals(AntiExfilException.Code.STATE_INVALID, wrongWallet.getCode());
-        assertEquals(wrongWalletBefore, treeFingerprint(temporary));
-    }
-
-    @Test
-    void missingSessionLoadIsStatePreservingAcrossRepeatedFreshDirectories() throws Exception {
-        for(int i = 0; i < 100; i++) {
-            Path parent = temporary.resolve("missing-" + i);
-            Files.createDirectory(parent);
-            Files.writeString(parent.resolve("sentinel.txt"), "unchanged-" + i, StandardCharsets.US_ASCII);
-            Path missingSession = parent.resolve("session.aexs");
-            Path missingJournal = parent.resolve("wallet.aexj");
-            List<String> before = treeFingerprint(parent);
-
-            AntiExfilException missing = assertThrows(AntiExfilException.class,
-                    () -> AntiExfilCoordinator.load(missingSession, missingJournal, keystore));
-
-            assertEquals(AntiExfilException.Code.STATE_INVALID, missing.getCode());
-            assertEquals("Cannot access durable anti-exfil state: Coordinator session does not exist",
-                    missing.getMessage());
-            assertEquals(before, treeFingerprint(parent));
-            assertFalse(Files.exists(missingSession));
-            assertFalse(Files.exists(Path.of(missingSession + ".lock")));
-            assertFalse(Files.exists(missingJournal));
-            assertFalse(Files.exists(Path.of(missingJournal + ".lock")));
-            try(var children = Files.list(parent)) {
-                assertEquals(List.of("sentinel.txt"), children.map(path -> path.getFileName().toString()).sorted().toList());
+    private List<AntiExfilAbortJournal.AbortEvent> events() {return new AntiExfilAbortJournal(journal,AntiExfilCoordinator.getWalletKeyIdentity(keystore)).getEvents();}
+    private void assertNoRevealOnDisk(byte[] reveal) throws Exception {
+        try(var files=Files.walk(temporary)) {
+            for(Path file:files.filter(Files::isRegularFile).toList()) {
+                String bytes=Utils.bytesToHex(Files.readAllBytes(file));
+                assertFalse(bytes.contains(Utils.bytesToHex(reveal)));
+                for(AntiExfilSlot slot:AntiExfilCodec.decode(reveal).getSlots()) assertFalse(bytes.contains(Utils.bytesToHex(slot.getHostRandomness())));
             }
         }
     }
-
-    @Test
-    void refusesCompletionBeforeOpeningsAndAbortAfterCompletion() {
-        AntiExfilCoordinator coordinator = create(session);
-        assertThrows(AntiExfilException.class, () -> coordinator.complete(message4));
-        coordinator.acceptOpenings(message2);
-        coordinator.complete(message4);
-        assertThrows(AntiExfilException.class, () -> coordinator.recordPostRevealAbort(AntiExfilCoordinator.AbortReason.USER_ABANDONED));
+    private byte[] openingsFor(AntiExfilCoordinator coordinator) {
+        var commit=AntiExfilCodec.decode(coordinator.getHostCommitMessage());var template=AntiExfilCodec.decode(message4);
+        List<AntiExfilSlot> slots=new ArrayList<>();
+        for(int i=0;i<commit.getSlots().size();i++) {var slot=commit.getSlots().get(i);slots.add(new AntiExfilSlot(slot.getInputIndex(),slot.getSighashType(),slot.getSignerPublicKey(),slot.getMessageHash(),slot.getCommitment(),template.getSlots().get(i).getOpening(),null,null));}
+        return AntiExfilCodec.encode(new AntiExfilMessage(commit.getNetwork(),AntiExfilStage.SIGNER_OPENINGS,commit.getSessionId(),commit.getPsbtDigest(),slots));
     }
+    private byte[] foreign(byte[] encoded) {var m=AntiExfilCodec.decode(encoded);byte[] id=m.getSessionId();id[0]^=1;return AntiExfilCodec.encode(new AntiExfilMessage(m.getNetwork(),m.getStage(),id,m.getPsbtDigest(),m.getSlots()));}
 
     private AntiExfilCoordinator create(Path path) {
         return AntiExfilCoordinator.create(path, journal, raw, keystore, AntiExfilNetwork.TESTNET4,
