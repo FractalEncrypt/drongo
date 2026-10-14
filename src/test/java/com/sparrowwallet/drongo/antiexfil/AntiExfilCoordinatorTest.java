@@ -206,7 +206,7 @@ class AntiExfilCoordinatorTest {
 
     @Test
     void legacyAbortHistoryIsPreservedAndNeverAcknowledgedAway() throws Exception {
-        var log=new AntiExfilAbortJournal(journal,AntiExfilCoordinator.getWalletKeyIdentity(keystore));
+        var log=new AntiExfilAbortJournal(journal,AntiExfilCoordinator.getSigningKeyHistoryIdentity(keystore));
         log.append(repeat((byte)1),repeat((byte)2),"USER_ABANDONED");
         // Construct a valid historical version-one journal without secret contents.
         byte[] body=AntiExfilDurableFiles.read(journal,4*1024*1024);body[4]=1;
@@ -224,7 +224,51 @@ class AntiExfilCoordinatorTest {
         assertDoesNotThrow(()->create(session));
     }
 
-    private List<AntiExfilAbortJournal.AbortEvent> events() {return new AntiExfilAbortJournal(journal,AntiExfilCoordinator.getWalletKeyIdentity(keystore)).getEvents();}
+    @Test
+    void changedOriginCannotGiveSameAccountASeparateHistoryDomain() {
+        Keystore alias=keystore.copy();alias.setKeyDerivation(new KeyDerivation("00000000",keystore.getKeyDerivation().getDerivationPath()));
+        assertFalse(Arrays.equals(AntiExfilCoordinator.getWalletKeyIdentity(keystore),AntiExfilCoordinator.getWalletKeyIdentity(alias)));
+        assertArrayEquals(AntiExfilCoordinator.getSigningKeyHistoryIdentity(keystore),AntiExfilCoordinator.getSigningKeyHistoryIdentity(alias));
+        var coordinator=create(session);coordinator.acceptOpenings(message2);
+        byte[] aliasPsbt=withOrigin("00000000");
+        assertDoesNotThrow(()->AntiExfilCoordinator.create(null,temporary.resolve("alias-control.aexj"),aliasPsbt,alias,AntiExfilNetwork.TESTNET4));
+        assertEquals(AntiExfilException.Code.RETRY_CONFLICT,assertThrows(AntiExfilException.class,()->AntiExfilCoordinator.create(null,journal,aliasPsbt,alias,AntiExfilNetwork.TESTNET4,true)).getCode());
+    }
+
+    @Test
+    void legacyMigrationPreservesOldJournalAndBlocksOriginAliases() throws Exception {
+        Path legacy=temporary.resolve("old-origin.aexj");
+        new AntiExfilAbortJournal(legacy,AntiExfilCoordinator.getWalletKeyIdentity(keystore)).append(repeat((byte)5),repeat((byte)6),"USER_ABANDONED");
+        byte[] legacyBody=AntiExfilDurableFiles.read(legacy,4*1024*1024);legacyBody[4]=1;
+        AntiExfilDurableFiles.write(legacy,legacyBody,false,4*1024*1024);
+        byte[] before=Files.readAllBytes(legacy);
+        AntiExfilCoordinator.preserveLegacyHistory(journal,legacy,false,keystore);
+        assertArrayEquals(before,Files.readAllBytes(legacy));assertEquals("LEGACY_ACCOUNT_HISTORY",events().getFirst().getReason());
+        Keystore alias=keystore.copy();alias.setKeyDerivation(new KeyDerivation("00000000",keystore.getKeyDerivation().getDerivationPath()));
+        assertEquals(AntiExfilException.Code.RETRY_CONFLICT,assertThrows(AntiExfilException.class,()->AntiExfilCoordinator.create(null,journal,withOrigin("00000000"),alias,AntiExfilNetwork.TESTNET4,true)).getCode());
+        AntiExfilCoordinator.preserveLegacyHistory(journal,legacy,false,keystore);assertEquals(1,events().size());
+    }
+
+    @Test
+    void legacySessionPresenceBlocksWithoutOpeningOrDeletingSecretFile() throws Exception {
+        Files.write(session,new byte[]{'A','E','X','S',99});byte[] before=Files.readAllBytes(session);
+        AntiExfilCoordinator.preserveLegacyHistory(journal,temporary.resolve("absent-old-journal.aexj"),true,keystore);
+        assertArrayEquals(before,Files.readAllBytes(session));assertFalse(Files.exists(temporary.resolve("absent-old-journal.aexj")));
+        assertThrows(AntiExfilException.class,()->create(session));
+    }
+
+    private List<AntiExfilAbortJournal.AbortEvent> events() {return new AntiExfilAbortJournal(journal,AntiExfilCoordinator.getSigningKeyHistoryIdentity(keystore)).getEvents();}
+    private byte[] withOrigin(String fingerprint) {
+        var psbt=AntiExfilPsbt.parseCanonicalV0(raw);
+        for(var input:psbt.getPsbtInputs()) {
+            for(var entry:input.getDerivedPublicKeys().entrySet()) {
+                if(entry.getValue().getMasterFingerprint().equals(keystore.getKeyDerivation().getMasterFingerprint())) {
+                    entry.setValue(new KeyDerivation(fingerprint,entry.getValue().getDerivationPath()));
+                }
+            }
+        }
+        return psbt.serialize();
+    }
     private void assertNoRevealOnDisk(byte[] reveal) throws Exception {
         try(var files=Files.walk(temporary)) {
             for(Path file:files.filter(Files::isRegularFile).toList()) {

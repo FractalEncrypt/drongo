@@ -7,6 +7,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.nio.file.Files;
 import java.security.SecureRandom;
 import java.util.*;
 import static com.sparrowwallet.drongo.antiexfil.AntiExfilException.Code.*;
@@ -215,7 +216,32 @@ public final class AntiExfilCoordinator implements AutoCloseable {
         return new Status(phase, sessionId, psbtDigest, abortJournal().getEvents().size(), false);
     }
 
-    private AntiExfilAbortJournal abortJournal() { return new AntiExfilAbortJournal(journalPath, walletIdentity); }
+    private AntiExfilAbortJournal abortJournal() { return new AntiExfilAbortJournal(journalPath, getSigningKeyHistoryIdentity(keystore)); }
+
+    /** History is independent of mutable wallet labels, origin metadata and signer model. */
+    public static byte[] getSigningKeyHistoryIdentity(Keystore keystore) {
+        if(keystore == null || keystore.getExtendedPublicKey() == null) throw fail(STATE_INVALID, "Public account key is required");
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        bytes.writeBytes(keystore.getExtendedPublicKey().getKey().getPubKey());
+        bytes.writeBytes(keystore.getExtendedPublicKey().getKey().getChainCode());
+        return Sha256Hash.hash(bytes.toByteArray());
+    }
+
+    /** Preserve known legacy history without opening a rho-bearing session file or resetting the old journal. */
+    public static void preserveLegacyHistory(Path historyPath, Path legacyJournalPath, boolean legacySessionPresent, Keystore keystore) {
+        byte[] oldIdentity = getWalletKeyIdentity(keystore);
+        AntiExfilAbortJournal history = new AntiExfilAbortJournal(historyPath, getSigningKeyHistoryIdentity(keystore));
+        history.locked(journal -> {
+            boolean legacyAbort = Files.exists(legacyJournalPath)
+                    && !new AntiExfilAbortJournal(legacyJournalPath, oldIdentity).getEvents().isEmpty();
+            if(legacySessionPresent || legacyAbort) {
+                // The old journal/session is retained at its original path. This nonsecret reference
+                // makes the conservative refusal follow the actual account even if origin metadata changes.
+                journal.append(Sha256Hash.hash(oldIdentity), oldIdentity, "LEGACY_ACCOUNT_HISTORY");
+            }
+            return null;
+        });
+    }
 
     /** Best-effort wiping of owned arrays, not a promise to erase JVM/OS copies. */
     @Override public synchronized void close() {
