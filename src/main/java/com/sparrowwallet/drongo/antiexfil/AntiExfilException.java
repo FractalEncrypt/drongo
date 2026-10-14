@@ -12,7 +12,11 @@ public class AntiExfilException extends IllegalArgumentException {
         UNEXPECTED_RETURN_DATA,
         SESSION_MISMATCH,
         RETRY_CONFLICT,
-        STATE_INVALID
+        STATE_INVALID,
+        ACCOUNT_EXCHANGE_BUSY,
+        HISTORY_STORAGE_ERROR,
+        VERSION_CONFLICT,
+        RECOVERY_APPROVAL_REQUIRED
     }
 
     private final Code code;

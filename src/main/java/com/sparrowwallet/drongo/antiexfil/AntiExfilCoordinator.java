@@ -17,7 +17,9 @@ import static com.sparrowwallet.drongo.antiexfil.AntiExfilException.Code.*;
  * recorded reveal QRs remain outside the application's non-retention boundary. */
 public final class AntiExfilCoordinator implements AutoCloseable {
     private static final int MAX_PSBT_BYTES = 16 * 1024 * 1024;
-    private final Path journalPath;
+    private final AntiExfilRecoveryHistory history;
+    private final AntiExfilExchangeLease lease;
+    private final AntiExfilRecoveryHistory.Context context;
     private final Keystore keystore;
     private final byte[] walletIdentity;
     private State state;
@@ -26,57 +28,134 @@ public final class AntiExfilCoordinator implements AutoCloseable {
     private byte[] sessionId;
     private byte[] psbtDigest;
 
-    private AntiExfilCoordinator(Path journalPath, Keystore keystore) {
-        if(journalPath == null || keystore == null) throw fail(STATE_INVALID, "Journal and keystore are required");
-        this.journalPath = AntiExfilDurableFiles.canonicalPath(journalPath);
-        this.keystore = keystore;
+    private AntiExfilCoordinator(PreparedAttempt attempt) {
+        this.history = attempt.history;
+        this.lease = attempt.lease;
+        this.context = attempt.context;
+        this.keystore = attempt.keystore;
         this.walletIdentity = getWalletKeyIdentity(keystore);
     }
 
-    public static AntiExfilCoordinator create(Path ignoredSessionPath, Path journalPath, byte[] originalPsbt,
-                                               Keystore keystore, AntiExfilNetwork network) {
-        return create(ignoredSessionPath, journalPath, originalPsbt, keystore, network, false, new SecureRandom());
+    public record RecoverySummary(String account, String unsignedTxid, long starts, long possibleReveals,
+                                  long completions, long unfinishedAfterReveal, long thisPaymentUnfinished, long unknownPaymentUnfinished,
+                                  boolean unknownLegacyHistory, Map<String, Long> reasons) {
+        public RecoverySummary { reasons = Map.copyOf(reasons); }
+        public boolean requiresConfirmation() { return unfinishedAfterReveal != 0 || unknownLegacyHistory; }
+    }
+    public static final class Approval {
+        private final PreparedAttempt owner;
+        private Approval(PreparedAttempt owner) { this.owner = owner; }
     }
 
-    /** Legacy signature retained for source compatibility. Acknowledgement cannot override uncertainty. */
-    public static AntiExfilCoordinator create(Path ignoredSessionPath, Path journalPath, byte[] originalPsbt,
-                                               Keystore keystore, AntiExfilNetwork network, boolean ignoredAcknowledgement) {
-        return create(ignoredSessionPath, journalPath, originalPsbt, keystore, network, ignoredAcknowledgement, new SecureRandom());
-    }
+    /** Owns the account while the dialog is open, but holds no short history lock. */
+    public static final class PreparedAttempt implements AutoCloseable {
+        private final AntiExfilExchangeLease lease;
+        private final AntiExfilRecoveryHistory history;
+        private final AntiExfilRecoveryHistory.Context context;
+        private final Keystore keystore;
+        private final AntiExfilNetwork network;
+        private final String revision;
+        private final AntiExfilRecoveryHistory.Counts counts;
+        private final RecoverySummary summary;
+        private final byte[] psbt;
+        private boolean closed, transferred;
 
-    static AntiExfilCoordinator create(Path ignoredSessionPath, Path journalPath, byte[] originalPsbt,
-                                        Keystore keystore, AntiExfilNetwork network, boolean ignoredAcknowledgement, SecureRandom random) {
-        if(keystore == null || !keystore.supportsAntiExfil()) throw fail(STATE_INVALID, "Keystore does not support anti-exfil signing");
-        if(originalPsbt == null || originalPsbt.length > MAX_PSBT_BYTES || network == null || random == null) {
-            throw fail(INVALID_MESSAGE, "Invalid coordinator initialization");
-        }
-        // Reject invalid PSBT semantics/signatures before any durable journal is created.
-        List<AntiExfilSigningSlot> slots = AntiExfilPsbt.enumerateSigningSlots(originalPsbt, keystore);
-        AntiExfilCoordinator coordinator = new AntiExfilCoordinator(journalPath, keystore);
-        return coordinator.abortJournal().locked(journal -> {
-            journal.requireFreshAttempt();
-            byte[] id = random32(random);
-            Map<AntiExfilSigningSlot.Identifier, byte[]> rhos = new LinkedHashMap<>();
+        private PreparedAttempt(Path directory, List<AntiExfilRecoveryHistory.Legacy> legacy, boolean legacySessions,
+                                byte[] psbt, Keystore keystore, AntiExfilNetwork network, SecureRandom random) {
+            if(keystore == null || !keystore.supportsAntiExfil()) throw fail(STATE_INVALID, "Keystore does not support anti-exfil signing");
+            if(psbt == null || psbt.length > MAX_PSBT_BYTES || network == null || random == null) throw fail(INVALID_MESSAGE, "Invalid coordinator initialization");
+            AntiExfilPsbt.enumerateSigningSlots(psbt, keystore); // Before any history is created.
+            this.psbt = psbt.clone(); this.keystore = publicSnapshot(keystore); this.network = network;
+            lease = AntiExfilExchangeLease.acquire(directory);
             try {
-                for(AntiExfilSigningSlot slot : slots) {
-                    byte[] rho;
-                    int attempts = 0;
-                    do {
-                        if(attempts++ >= 1024) throw fail(STATE_INVALID, "CSPRNG repeatedly produced duplicate host randomness");
-                        rho = random32(random);
-                    } while(containsValue(rhos, rho));
-                    rhos.put(slot.getIdentifier(), rho);
+                history = new AntiExfilRecoveryHistory(directory, getSigningKeyHistoryIdentity(keystore), lease);
+                history.reconcile();
+                history.importLegacy(legacy, legacySessions);
+                String sid = null;
+                for(int i = 0; i < 1024; i++) {
+                    String candidate = com.sparrowwallet.drongo.Utils.bytesToHex(random32(random));
+                    if(!history.hasSession(candidate)) { sid = candidate; break; }
                 }
-                AntiExfilMessage commit = AntiExfilPsbt.buildHostCommitMessage(originalPsbt, keystore, network, id, rhos);
-                coordinator.state = new State(Phase.COMMITMENTS_CREATED, coordinator.walletIdentity, originalPsbt,
-                        AntiExfilCodec.encode(commit), null, null, null, null, rhos, null);
-                coordinator.sessionId = id.clone();
-                coordinator.psbtDigest = commit.getPsbtDigest();
-                return coordinator;
-            } finally {
-                rhos.values().forEach(rho -> Arrays.fill(rho, (byte)0));
-            }
-        });
+                if(sid == null) throw fail(STATE_INVALID, "CSPRNG repeatedly reused session identities");
+                String payment = AntiExfilPsbt.parseCanonicalV0(psbt).getTransaction().getTxId().toString();
+                context = new AntiExfilRecoveryHistory.Context(sid, com.sparrowwallet.drongo.Utils.bytesToHex(Sha256Hash.hash(psbt)), payment, network.getCode());
+                revision = history.revision(); counts = history.counts();
+                summary = new RecoverySummary(com.sparrowwallet.drongo.Utils.bytesToHex(getSigningKeyHistoryIdentity(keystore)), payment,
+                        counts.starts(), counts.reveals(), counts.completions(), counts.uncertain(), history.paymentUncertain(payment), history.unknownPaymentUncertain(), counts.unknown(), history.reasonCounts());
+            } catch(RuntimeException e) { lease.close(); Arrays.fill(this.psbt, (byte)0); throw e; }
+        }
+        public RecoverySummary summary() { if(closed) throw fail(STATE_INVALID, "Prepared exchange is closed"); return summary; }
+        public Approval approve() { summary(); return new Approval(this); }
+        public AntiExfilCoordinator start(Approval approval) { return start(approval, new SecureRandom()); }
+        private AntiExfilCoordinator start(Approval approval, SecureRandom random) {
+            if(closed || transferred) throw fail(STATE_INVALID, "Prepared exchange was already consumed");
+            try {
+                lease.check(); history.refresh();
+                if(!revision.equals(history.revision()) || !counts.equals(history.counts())) throw fail(RECOVERY_APPROVAL_REQUIRED, "History changed while confirmation was open; prepare and confirm again");
+                if(approval != null && approval.owner != this) throw fail(RECOVERY_APPROVAL_REQUIRED, "Approval belongs to a different prepared exchange");
+                history.start(context, approval != null);
+                AntiExfilCoordinator coordinator = new AntiExfilCoordinator(this);
+                Map<AntiExfilSigningSlot.Identifier, byte[]> rhos = new LinkedHashMap<>();
+                try {
+                    for(AntiExfilSigningSlot slot : AntiExfilPsbt.enumerateSigningSlots(psbt, keystore)) {
+                        byte[] rho = null;
+                        for(int i = 0; i < 1024; i++) {
+                            byte[] candidate = random32(random);
+                            if(!containsValue(rhos, candidate)) { rho = candidate; break; }
+                            Arrays.fill(candidate, (byte)0);
+                        }
+                        if(rho == null) throw fail(STATE_INVALID, "CSPRNG repeatedly produced duplicate host randomness");
+                        rhos.put(slot.getIdentifier(), rho);
+                    }
+                    byte[] id = com.sparrowwallet.drongo.Utils.hexToBytes(context.session());
+                    AntiExfilMessage commit = AntiExfilPsbt.buildHostCommitMessage(psbt, keystore, network, id, rhos);
+                    coordinator.state = new State(Phase.COMMITMENTS_CREATED, coordinator.walletIdentity, psbt,
+                            AntiExfilCodec.encode(commit), null, null, null, null, rhos, null);
+                    coordinator.sessionId = id; coordinator.psbtDigest = commit.getPsbtDigest();
+                    history.beforeDisclosure();
+                    transferred = true;
+                    return coordinator;
+                } finally {
+                    rhos.values().forEach(value -> Arrays.fill(value, (byte)0));
+                    if(!transferred) coordinator.closeWithoutEvent();
+                }
+            } catch(RuntimeException e) { close(); throw e; }
+        }
+        @Override public void close() {
+            if(closed) return;
+            closed = true; Arrays.fill(psbt, (byte)0);
+            if(!transferred) lease.close();
+        }
+    }
+
+    private static Keystore publicSnapshot(Keystore original) {
+        Keystore copy = new Keystore();
+        copy.setSource(original.getSource()); copy.setWalletModel(original.getWalletModel());
+        copy.setAntiExfilPolicy(original.getAntiExfilPolicy()); copy.setAntiExfilProfile(original.getAntiExfilProfile());
+        copy.setKeyDerivation(original.getKeyDerivation().copy());
+        copy.setExtendedPublicKey(original.getExtendedPublicKey().copy());
+        return copy;
+    }
+
+    public static PreparedAttempt prepare(Path directory, Path ramJournal, Path legacyJournal, boolean legacySessionPresent,
+                                          byte[] psbt, Keystore keystore, AntiExfilNetwork network) {
+        List<AntiExfilRecoveryHistory.Legacy> sources = new ArrayList<>();
+        if(ramJournal != null) sources.add(new AntiExfilRecoveryHistory.Legacy(ramJournal, getSigningKeyHistoryIdentity(keystore)));
+        if(legacyJournal != null && !legacyJournal.equals(ramJournal)) sources.add(new AntiExfilRecoveryHistory.Legacy(legacyJournal, getWalletKeyIdentity(keystore)));
+        return new PreparedAttempt(directory, sources, legacySessionPresent, psbt, keystore, network, new SecureRandom());
+    }
+    public static AntiExfilCoordinator create(Path ignoredSessionPath, Path journalPath, byte[] psbt, Keystore keystore, AntiExfilNetwork network) {
+        return create(ignoredSessionPath, journalPath, psbt, keystore, network, false, new SecureRandom());
+    }
+    /** A legacy boolean is not an approval token and cannot suppress confirmation. */
+    public static AntiExfilCoordinator create(Path ignoredSessionPath, Path journalPath, byte[] psbt, Keystore keystore, AntiExfilNetwork network, boolean ignored) {
+        return create(ignoredSessionPath, journalPath, psbt, keystore, network, ignored, new SecureRandom());
+    }
+    static AntiExfilCoordinator create(Path ignoredSessionPath, Path journalPath, byte[] psbt, Keystore keystore, AntiExfilNetwork network, boolean ignored, SecureRandom random) {
+        Path directory = journalPath.toAbsolutePath().getParent().resolve("history-v3").resolve(com.sparrowwallet.drongo.Utils.bytesToHex(getSigningKeyHistoryIdentity(keystore)));
+        try(var attempt = new PreparedAttempt(directory, List.of(new AntiExfilRecoveryHistory.Legacy(journalPath, getSigningKeyHistoryIdentity(keystore))), false, psbt, keystore, network, random)) {
+            return attempt.start(null, random);
+        }
     }
 
     /** Never opens or replays legacy secret-bearing session files. */
@@ -88,12 +167,15 @@ public final class AntiExfilCoordinator implements AutoCloseable {
         if(state == null) throw fail(STATE_INVALID, "Active anti-exfil host state is no longer available");
         return state;
     }
-    public synchronized byte[] getHostCommitMessage() { return active().message1.clone(); }
+    public synchronized byte[] getHostCommitMessage() { return transition(() -> { history.beforeDisclosure(); return active().message1.clone(); }); }
     public synchronized byte[] getFrozenPsbt() { return active().originalPsbt.clone(); }
     public synchronized byte[] getHostRevealMessage() {
-        State state = active();
-        if(state.phase != Phase.OPENINGS_ACCEPTED) throw fail(WRONG_STAGE, "Signer openings have not been accepted");
-        return state.message3.clone();
+        return transition(() -> {
+            State state = active();
+            if(state.phase != Phase.OPENINGS_ACCEPTED) throw fail(WRONG_STAGE, "Signer openings have not been accepted");
+            history.beforeDisclosure();
+            return state.message3.clone();
+        });
     }
     public synchronized Completion getCompletedResult() {
         if(completed == null) throw fail(WRONG_STAGE, "Coordinator session is not complete");
@@ -101,15 +183,16 @@ public final class AntiExfilCoordinator implements AutoCloseable {
     }
 
     public synchronized byte[] acceptOpenings(byte[] encodedOpenings) {
-        if(encodedOpenings == null) throw fail(INVALID_MESSAGE, "Signer openings are required");
-        State current = active();
-        return abortJournal().locked(journal -> {
+        return transition(() -> {
+            if(encodedOpenings == null) throw fail(INVALID_MESSAGE, "Signer openings are required");
+            State current = active();
             if(current.phase == Phase.OPENINGS_ACCEPTED) {
-                journal.requirePending(sessionId, psbtDigest);
+                history.requirePending(context);
                 if(!Arrays.equals(encodedOpenings, current.message2)) throw fail(RETRY_CONFLICT, "Retry changed accepted signer openings");
+                history.beforeDisclosure();
                 return current.message3.clone();
             }
-            journal.requireFreshAttempt();
+
             AntiExfilMessage commit = AntiExfilCodec.decode(current.message1);
             AntiExfilMessage openings = AntiExfilCodec.decode(encodedOpenings);
             if(openings.getStage() != AntiExfilStage.SIGNER_OPENINGS) throw fail(WRONG_STAGE, "Expected signer openings");
@@ -127,21 +210,22 @@ public final class AntiExfilCoordinator implements AutoCloseable {
             byte[] message3 = AntiExfilCodec.encode(reveal);
             // Persist only a nonsecret marker BEFORE any reveal bytes can be returned.
             // If persistence fails, no reveal is returned. No acknowledgement can bypass it.
-            journal.beginReveal(sessionId, psbtDigest);
+            history.reveal(context);
             state = new State(Phase.OPENINGS_ACCEPTED, walletIdentity, current.originalPsbt,
                     current.message1, encodedOpenings, message3, null, null, current.rhos, null);
             phase = Phase.OPENINGS_ACCEPTED;
             wipe(current);
+            history.beforeDisclosure();
             return message3;
         });
     }
 
     public synchronized Completion complete(byte[] encodedSignatures) {
-        if(encodedSignatures == null) throw fail(INVALID_MESSAGE, "Signer signatures are required");
-        State current = active();
-        if(current.phase != Phase.OPENINGS_ACCEPTED) throw fail(WRONG_STAGE, "Cannot complete before accepting openings");
-        return abortJournal().locked(journal -> {
-            journal.requirePending(sessionId, psbtDigest);
+        return transition(() -> {
+            if(encodedSignatures == null) throw fail(INVALID_MESSAGE, "Signer signatures are required");
+            State current = active();
+            if(current.phase != Phase.OPENINGS_ACCEPTED) throw fail(WRONG_STAGE, "Cannot complete before accepting openings");
+            history.requirePending(context);
             AntiExfilMessage reveal = AntiExfilCodec.decode(current.message3);
             AntiExfilMessage signatures = AntiExfilCodec.decode(encodedSignatures);
             if(signatures.getStage() != AntiExfilStage.SIGNER_SIGNATURES) throw fail(WRONG_STAGE, "Expected signer signatures");
@@ -153,11 +237,13 @@ public final class AntiExfilCoordinator implements AutoCloseable {
             try {
                 Completion result = new Completion(signed, deriveVerifiedSignatures(verified), false);
                 // A crash before durable resolution remains uncertain, even after successful verification.
-                journal.resolveReveal(sessionId, psbtDigest);
+                history.complete(context);
+                history.beforeDisclosure();
                 completed = result;
                 phase = Phase.COMPLETE;
                 wipe(current);
                 state = null;
+                lease.close();
                 return result;
             } finally {
                 wipe(verified);
@@ -198,25 +284,30 @@ public final class AntiExfilCoordinator implements AutoCloseable {
 
 
     public synchronized AntiExfilAbortJournal.AbortEvent recordPostRevealAbort(AbortReason reason) {
-        if(reason == null || phase != Phase.OPENINGS_ACCEPTED) throw fail(WRONG_STAGE, "Only an active post-reveal session can be abandoned");
-        try { return abortJournal().locked(journal -> journal.noteUnresolved(sessionId, psbtDigest, reason.name())); }
-        finally { close(); }
+        if(reason == null || phase != Phase.OPENINGS_ACCEPTED) throw fail(WRONG_STAGE, "Only a live post-reveal exchange can end");
+        try { history.end(context, reason.name(), false); return null; }
+        finally { closeWithoutEvent(); }
     }
-
     public synchronized AntiExfilAbortJournal.AbortEvent recordSignerDataRejection() {
-        active();
-        try {
-            return abortJournal().locked(journal -> phase == Phase.OPENINGS_ACCEPTED
-                    ? journal.noteUnresolved(sessionId, psbtDigest, AbortReason.SIGNATURE_REJECTED.name())
-                    : journal.append(sessionId, psbtDigest, "PRE_REVEAL_REJECTED"));
-        } finally { close(); }
+        if(state == null) return null; // A coordinator validation failure already recorded it.
+        try { history.end(context, "SIGNATURE_REJECTED", true); return null; }
+        finally { closeWithoutEvent(); }
     }
-
     public synchronized Status getStatus() {
-        return new Status(phase, sessionId, psbtDigest, abortJournal().getEvents().size(), false);
+        return new Status(phase, sessionId, psbtDigest, (int)Math.min(Integer.MAX_VALUE, history.counts().uncertain()), false);
     }
-
-    private AntiExfilAbortJournal abortJournal() { return new AntiExfilAbortJournal(journalPath, getSigningKeyHistoryIdentity(keystore)); }
+    private <T> T transition(java.util.function.Supplier<T> action) {
+        try { return action.get(); }
+        catch(RuntimeException failure) {
+            try {
+                if(state != null && (!(failure instanceof AntiExfilException ae) ||
+                        (ae.getCode() != HISTORY_STORAGE_ERROR && ae.getCode() != VERSION_CONFLICT)))
+                    history.end(context, failure instanceof AntiExfilException ae && isSignerDataRejection(ae) ? "SIGNATURE_REJECTED" : "TRANSPORT_FAILED", true);
+            } catch(RuntimeException bookkeeping) { failure.addSuppressed(bookkeeping); }
+            finally { closeWithoutEvent(); }
+            throw failure;
+        }
+    }
 
     /** History is independent of mutable wallet labels, origin metadata and signer model. */
     public static byte[] getSigningKeyHistoryIdentity(Keystore keystore) {
@@ -227,26 +318,21 @@ public final class AntiExfilCoordinator implements AutoCloseable {
         return Sha256Hash.hash(bytes.toByteArray());
     }
 
-    /** Preserve known legacy history without opening a rho-bearing session file or resetting the old journal. */
-    public static void preserveLegacyHistory(Path historyPath, Path legacyJournalPath, boolean legacySessionPresent, Keystore keystore) {
-        byte[] oldIdentity = getWalletKeyIdentity(keystore);
-        AntiExfilAbortJournal history = new AntiExfilAbortJournal(historyPath, getSigningKeyHistoryIdentity(keystore));
-        history.locked(journal -> {
-            boolean legacyAbort = Files.exists(legacyJournalPath)
-                    && !new AntiExfilAbortJournal(legacyJournalPath, oldIdentity).getEvents().isEmpty();
-            if(legacySessionPresent || legacyAbort) {
-                // The old journal/session is retained at its original path. This nonsecret reference
-                // makes the conservative refusal follow the actual account even if origin metadata changes.
-                journal.append(Sha256Hash.hash(oldIdentity), oldIdentity, "LEGACY_ACCOUNT_HISTORY");
-            }
-            return null;
-        });
+    /** Legacy callers must use prepare() so migration and confirmation share the lease. */
+    @Deprecated public static void preserveLegacyHistory(Path historyPath, Path legacyJournalPath, boolean present, Keystore keystore) {
+        throw fail(STATE_INVALID, "Use prepared recovery with read-only V2 migration");
     }
 
-    /** Best-effort wiping of owned arrays, not a promise to erase JVM/OS copies. */
+    /** Best-effort wiping; JVM/OS copies are outside the non-retention guarantee. */
     @Override public synchronized void close() {
-        if(state != null) { wipe(state); state = null; }
-        if(phase != Phase.COMPLETE) phase = Phase.CLOSED;
+        try { if(state != null) history.end(context, "HOST_EXCHANGE_CLOSED", false); }
+        finally { closeWithoutEvent(); }
+    }
+    private void closeWithoutEvent() {
+        try {
+            if(state != null) { wipe(state); state = null; }
+            if(phase != Phase.COMPLETE) phase = Phase.CLOSED;
+        } finally { lease.close(); }
     }
     private static void wipe(State state) {
         for(byte[] value : new byte[][]{state.originalPsbt, state.message1, state.message2, state.message3, state.message4, state.signedPsbt}) {
@@ -287,7 +373,8 @@ public final class AntiExfilCoordinator implements AutoCloseable {
         return switch(exception.getCode()) {
             case INVALID_MESSAGE, TRANSACTION_MISMATCH, SIGNATURE_SLOT_MISMATCH, COMMITMENT_MISMATCH,
                     OPENING_MISMATCH, SIGNATURE_INVALID, UNEXPECTED_RETURN_DATA -> true;
-            case WRONG_STAGE, RETRY_CONFLICT, STATE_INVALID, SESSION_MISMATCH -> false;
+            case WRONG_STAGE, RETRY_CONFLICT, STATE_INVALID, SESSION_MISMATCH, ACCOUNT_EXCHANGE_BUSY,
+                    HISTORY_STORAGE_ERROR, VERSION_CONFLICT, RECOVERY_APPROVAL_REQUIRED -> false;
         };
     }
 

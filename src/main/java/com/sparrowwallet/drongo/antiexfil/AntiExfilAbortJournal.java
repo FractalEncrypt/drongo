@@ -38,6 +38,35 @@ public final class AntiExfilAbortJournal {
         return locked(LockedJournal::getEvents);
     }
 
+    /** Migration reader: no creation, rewrite, or session-file access. */
+    LegacySnapshot readOnlySnapshot() {
+        return readOnlySnapshot(null, null);
+    }
+    LegacySnapshot readOnlySnapshot(Long expectedBytes, byte[] expectedHash) {
+        return AntiExfilDurableFiles.locked(path, () -> {
+            if(!Files.exists(path)) {
+                if(expectedBytes != null && expectedBytes != -1) throw changedLegacy();
+                return new LegacySnapshot(-1, new byte[32], List.of());
+            }
+            long size = Files.size(path);
+            if(size > MAX_FILE_BYTES) {
+                if(expectedBytes != null) throw changedLegacy();
+                throw new IOException("Legacy history exceeds its format bound");
+            }
+            byte[] raw = Files.readAllBytes(path), hash = Sha256Hash.hash(raw);
+            if(expectedBytes != null && (raw.length != expectedBytes || !Arrays.equals(hash, expectedHash))) throw changedLegacy();
+            Journal loaded = decode(AntiExfilDurableFiles.read(path, MAX_FILE_BYTES));
+            if(!Arrays.equals(walletIdentity, loaded.walletIdentity)) throw new IOException("Legacy history identity differs");
+            return new LegacySnapshot(raw.length, hash, List.copyOf(loaded.events));
+        });
+    }
+    private static AntiExfilException changedLegacy() {
+        return new AntiExfilException(AntiExfilException.Code.VERSION_CONFLICT,
+                "Retained V2 history changed. Stop older hosts and preserve the files before investigation.");
+    }
+
+    record LegacySnapshot(long bytes, byte[] hash, List<AbortEvent> events) { }
+
     AbortEvent append(byte[] sessionId, byte[] psbtDigest, String reason) {
         String normalizedReason = validateEvent(sessionId, psbtDigest, reason);
         return locked(journal -> journal.append(sessionId, psbtDigest, normalizedReason));
